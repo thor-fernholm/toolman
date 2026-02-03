@@ -5,12 +5,6 @@ import (
 	"github.com/modfin/bellman/tools"
 )
 
-//// PTCPackage holds the generated PTC tool and the system prompt fragment
-//type PTCPackage struct {
-//	Tool           tools.Tool
-//	PromptFragment string
-//}
-
 type ProgLang string
 
 const (

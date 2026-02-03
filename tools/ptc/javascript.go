@@ -12,7 +12,7 @@ import (
 )
 
 // adaptToolsToJSPTC converts a list of Bellman tools into a single PTC tool with JS execution environment
-func adaptToolsToJSPTC(vm *goja.Runtime, inputTools []tools.Tool) tools.Tool {
+func adaptToolsToJSPTC(vm *goja.Runtime, inputTools []tools.Tool) []tools.Tool {
 	var descriptions []string
 
 	// Helper to extract keys from schema (naive implementation)
@@ -33,7 +33,7 @@ func adaptToolsToJSPTC(vm *goja.Runtime, inputTools []tools.Tool) tools.Tool {
 		err := bindToolToJSVM(vm, t)
 		if err != nil { //TODO: handle error
 			fmt.Printf("error occurred: %e\n", err)
-			return tools.Tool{}
+			return nil
 		}
 		// generate signature like: function_name({ argument })
 		argSig := getArgKeys(t.ArgumentSchema)
@@ -84,7 +84,7 @@ func adaptToolsToJSPTC(vm *goja.Runtime, inputTools []tools.Tool) tools.Tool {
 		tools.WithFunction(executor),
 	)
 
-	return ptcTool
+	return []tools.Tool{ptcTool}
 	//return PTCPackage{
 	//	Tool:           ptcTool,
 	//	PromptFragment: docsFragment, //TODO: remove or where should docs be used/visible?
