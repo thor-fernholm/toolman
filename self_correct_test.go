@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
+
 	//"math"
 	"os"
 	"testing"
@@ -72,6 +74,20 @@ func TestMockPTCSelfCorrect(t *testing.T) {
 		}
 
 		//fmt.Println("##### JS exec code:\n", arg.Code)
+		timeLimit := 2 * time.Second
+
+		timer := time.NewTimer(timeLimit)
+
+		defer timer.Stop()
+
+		go func() {
+			select {
+			case <-timer.C:
+				vm.Interrupt("execution timeout")
+			case <-ctx.Done():
+				vm.Interrupt("context cancelled")
+			}
+		}()
 
 		res, err := vm.RunString(arg.Code)
 		if err != nil {
@@ -154,9 +170,7 @@ You solve complex logic by writing JavaScript code for the code_execution tool.
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		runPrompt := originalPrompt
-		println("Prompt: ", runPrompt)
 		if attempt > 1 && lastErr != nil {
-			println("Nu fixas error")
 			runPrompt = fmt.Sprintf("%s\n\n"+
 				"The previous attempt failed because the generated JavaScript was not executable.\n"+
 				"Error message:\n%s\n\n"+
