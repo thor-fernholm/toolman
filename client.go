@@ -7,16 +7,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/modfin/bellman/models/embed"
-	"github.com/modfin/bellman/models/gen"
-	"github.com/modfin/bellman/prompt"
-	"github.com/modfin/bellman/tools"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"sync/atomic"
+
+	"github.com/dop251/goja"
+	"github.com/modfin/bellman/models/embed"
+	"github.com/modfin/bellman/models/gen"
+	"github.com/modfin/bellman/prompt"
+	"github.com/modfin/bellman/tools"
+	"github.com/modfin/bellman/tools/ptc"
 )
 
 const Provider = "Bellman"
@@ -259,8 +262,28 @@ func (g *generator) Prompt(conversation ...prompt.Prompt) (*gen.Response, error)
 		Prompts: conversation,
 	}
 
+	// adapt PTC tools TODO extract separate method?
+	if len(request.Tools) > 0 {
+		// create fresh vm for isolation and thread safety TODO eval other approach? and separate vms?
+		vm := goja.New()
+		err = vm.Set("CONFIG", map[string]string{
+			"token": g.bellman.key.Token,
+			"url":   g.bellman.url,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("could not init goja; %w", err)
+		}
+
+		regTools, ptcTool := ptc.AdaptToolsToPTC(vm, request.Tools, ptc.JavaScript) //TODO select language where?
+
+		if ptcTool != nil && len(ptcTool) > 0 {
+			request.Tools = append(regTools, ptcTool...)
+			request.SystemPrompt += ptc.GetSystemFragment()
+		}
+	}
+
 	toolBelt := map[string]*tools.Tool{}
-	for _, tool := range g.request.Tools {
+	for _, tool := range request.Tools {
 		toolBelt[tool.Name] = &tool
 	}
 
@@ -506,6 +529,26 @@ func (g *generator) buildStreamingRequest(conversation []prompt.Prompt) (gen.Ful
 	// Ensure streaming is enabled
 	request.Stream = true
 
+	// adapt PTC tools
+	if len(request.Tools) > 0 {
+		// create fresh vm for isolation and thread safety TODO eval other approach? and separate vms?
+		vm := goja.New()
+		err := vm.Set("CONFIG", map[string]string{
+			"token": g.bellman.key.Token,
+			"url":   g.bellman.url,
+		})
+		if err != nil {
+			return request, nil, fmt.Errorf("could not init goja; %w", err)
+		}
+
+		regTools, ptcTool := ptc.AdaptToolsToPTC(vm, request.Tools, ptc.JavaScript) //TODO select language where?
+
+		if ptcTool != nil && len(ptcTool) > 0 {
+			request.Tools = append(regTools, ptcTool...)
+			request.SystemPrompt += ptc.GetSystemFragment()
+		}
+	}
+
 	// Validate request parameters for streaming
 	if err := g.validateStreamingRequest(&request); err != nil {
 		return request, nil, err
@@ -513,7 +556,7 @@ func (g *generator) buildStreamingRequest(conversation []prompt.Prompt) (gen.Ful
 
 	// Build tool belt for tool call references
 	toolBelt := map[string]*tools.Tool{}
-	for _, tool := range g.request.Tools {
+	for _, tool := range request.Tools {
 		toolBelt[tool.Name] = &tool
 	}
 

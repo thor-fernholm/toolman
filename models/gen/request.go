@@ -2,6 +2,7 @@ package gen
 
 import (
 	"context"
+
 	"github.com/modfin/bellman/prompt"
 	"github.com/modfin/bellman/schema"
 	"github.com/modfin/bellman/tools"
