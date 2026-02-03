@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+
 	"github.com/modfin/bellman/schema"
 )
 
@@ -53,6 +54,13 @@ func WithArgSchema(arg any) ToolOption {
 	}
 }
 
+func WithPTC(usePTC bool) ToolOption {
+	return func(tool Tool) Tool {
+		tool.UsePTC = usePTC
+		return tool
+	}
+}
+
 func NewTool(name string, options ...ToolOption) Tool {
 	t := Tool{
 		Name: name,
@@ -68,6 +76,7 @@ type Tool struct {
 	Description    string                                               `json:"description"`
 	ArgumentSchema *schema.JSON                                         `json:"argument_schema,omitempty"`
 	Function       func(ctx context.Context, call Call) (string, error) `json:"-"`
+	UsePTC         bool                                                 `json:"use_ptc"` // false is default
 }
 
 type Call struct {
