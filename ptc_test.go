@@ -14,11 +14,11 @@ import (
 	"github.com/dop251/goja"
 	"github.com/joho/godotenv"
 	"github.com/modfin/bellman/agent"
+	"github.com/modfin/bellman/models/gen"
 	"github.com/modfin/bellman/prompt"
 	"github.com/modfin/bellman/services/openai"
 	"github.com/modfin/bellman/services/vertexai"
 	"github.com/modfin/bellman/tools"
-	"github.com/modfin/bellman/tools/ptc"
 )
 
 func TestToolman(t *testing.T) {
@@ -36,7 +36,7 @@ func TestToolman(t *testing.T) {
 	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
 	llm := client.Generator().Model(openai.GenModel_gpt4o_mini).
 		System("## Role\nYou are a Financial Assistant. Today is 2026-02-03.").
-		SetTools(allTools...).Temperature(0)
+		SetTools(allTools...).Temperature(0).SetPTCLanguage(gen.JavaScript)
 
 	const useGemini = false // quick-swap provider (gemini separate agent implementation)
 	if useGemini {
@@ -44,6 +44,82 @@ func TestToolman(t *testing.T) {
 	}
 
 	// prompt bellman
+	userPrompt := "Predict the future, convert 69 usd to sek, and then generate a secret password."
+
+	var res *agent.Result[Result]
+	switch llm.Request.Model.Provider {
+	case vertexai.Provider:
+		res, err = agent.RunWithToolsOnly[Result](10, 0, llm, prompt.AsUser(userPrompt))
+	default:
+		res, err = agent.Run[Result](10, 0, llm, prompt.AsUser(userPrompt))
+	}
+
+	if err != nil {
+		log.Fatalf("Prompt() error = %v", err)
+	}
+
+	// pretty print
+	prettyPrint(res)
+}
+
+func TestAutoPTC(t *testing.T) {
+	// get env vars
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+	bellmanUrl := os.Getenv("BELLMAN_URL")
+	bellmanToken := os.Getenv("BELLMAN_TOKEN")
+
+	// setup goja
+	vm := goja.New()
+	vm.Set("CONFIG", map[string]string{
+		"token": bellmanToken,
+		"url":   bellmanUrl,
+	})
+	vm.Set("goLog", func(msg string) { // enables logging to go env
+		fmt.Printf("[JS-LOG]: %s\n", msg)
+	})
+
+	// define bellman tools
+	mockTools := getMockBellmanTools()
+	//regularTools, PTCTools := ptc.AdaptToolsToPTC(vm, mockTools, gen.JavaScript)
+	//allTools := append(regularTools, PTCTools...)
+
+	// define system prompt
+	const systemPrompt = `## Role
+You are a Financial Assistant. Today is 2026-02-03.
+
+## Capabilities
+You solve complex logic by writing JavaScript code for the code_execution tool.
+
+## Rules for code_execution
+1. CALL LIMIT: You may call code_execution ONLY ONCE per turn. 
+2. LOGIC: Perform all calculations and multi-tool logic INSIDE the JS script. Before calling code_execution, plan how to combine all tasks into a single script. You are penalized for making more than one tool call.
+3. RETURN: The JS script MUST end with an object containing all final data.
+4. FORMAT: Do not use console.log for final data; the last evaluated expression is the return value.
+6. SYNTHESIS: Once you have the result from code_execution, you have everything you need. 
+7. TERMINATION: Do not call the tool again with the same or modified code.
+8. SYNC: Do not use async functions unless specified.
+
+## Example JS Script Input
+({
+  joke: askBellman(CONFIG.url, CONFIG.token, ""),
+  total: Sum(123, 456)
+})`
+
+	// create Bellman llm and run agent
+	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
+	llm := client.Generator().Model(openai.GenModel_gpt4o_mini).
+		System(systemPrompt).
+		SetTools(mockTools...).Temperature(0)
+
+	const useGemini = true // quick-swap provider (gemini separate agent implementation)
+	if useGemini {
+		llm = llm.Model(vertexai.GenModel_gemini_2_5_flash_latest)
+	}
+
+	// prompt, expected result --> <bad-bellman-joke> and 2222222211
 	userPrompt := "Predict the future, convert 69 usd to sek, and then generate a secret password."
 	type Result struct {
 		Text string `json:"text" json-description:"The final natural text answer to the user's request."`
@@ -78,81 +154,11 @@ func TestToolman(t *testing.T) {
 	}
 }
 
-func TestAutoPTC(t *testing.T) {
-	// get env vars
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
-	bellmanUrl := os.Getenv("BELLMAN_URL")
-	bellmanToken := os.Getenv("BELLMAN_TOKEN")
+type Result struct {
+	Text string `json:"text" json-description:"The final natural text answer to the user's request."`
+}
 
-	// setup goja
-	vm := goja.New()
-	vm.Set("CONFIG", map[string]string{
-		"token": bellmanToken,
-		"url":   bellmanUrl,
-	})
-	vm.Set("goLog", func(msg string) { // enables logging to go env
-		fmt.Printf("[JS-LOG]: %s\n", msg)
-	})
-
-	// define bellman tools
-	mockTools := getMockBellmanTools()
-	regularTools, PTCTools := ptc.AdaptToolsToPTC(vm, mockTools, ptc.JavaScript)
-	allTools := append(regularTools, PTCTools...)
-
-	// define system prompt
-	const systemPrompt = `## Role
-You are a Financial Assistant. Today is 2026-02-03.
-
-## Capabilities
-You solve complex logic by writing JavaScript code for the code_execution tool.
-
-## Rules for code_execution
-1. CALL LIMIT: You may call code_execution ONLY ONCE per turn. 
-2. LOGIC: Perform all calculations and multi-tool logic INSIDE the JS script. Before calling code_execution, plan how to combine all tasks into a single script. You are penalized for making more than one tool call.
-3. RETURN: The JS script MUST end with an object containing all final data.
-4. FORMAT: Do not use console.log for final data; the last evaluated expression is the return value.
-6. SYNTHESIS: Once you have the result from code_execution, you have everything you need. 
-7. TERMINATION: Do not call the tool again with the same or modified code.
-8. SYNC: Do not use async functions unless specified.
-
-## Example JS Script Input
-({
-  joke: askBellman(CONFIG.url, CONFIG.token, ""),
-  total: Sum(123, 456)
-})`
-
-	// create Bellman llm and run agent
-	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
-	llm := client.Generator().Model(openai.GenModel_gpt4o_mini).
-		System(systemPrompt).
-		SetTools(allTools...).Temperature(0)
-
-	const useGemini = true // quick-swap provider (gemini separate agent implementation)
-	if useGemini {
-		llm = llm.Model(vertexai.GenModel_gemini_2_5_flash_latest)
-	}
-
-	// prompt, expected result --> <bad-bellman-joke> and 2222222211
-	userPrompt := "Predict the future, convert 69 usd to sek, and then generate a secret password."
-	type Result struct {
-		Text string `json:"text" json-description:"The final natural text answer to the user's request."`
-	}
-	var res *agent.Result[Result]
-	switch llm.Request.Model.Provider {
-	case vertexai.Provider:
-		res, err = agent.RunWithToolsOnly[Result](10, 0, llm, prompt.AsUser(userPrompt))
-	default:
-		res, err = agent.Run[Result](10, 0, llm, prompt.AsUser(userPrompt))
-	}
-
-	if err != nil {
-		log.Fatalf("Prompt() error = %v", err)
-	}
-
-	// pretty print
+func prettyPrint(res *agent.Result[Result]) {
 	fmt.Printf("==== %s ====\n", res.Metadata.Model)
 	fmt.Printf("==== Result after %d calls ====\n", res.Depth)
 	fmt.Printf("%+v\n", res.Result.Text)
