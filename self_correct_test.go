@@ -80,11 +80,16 @@ func TestMockPTCSelfCorrect(t *testing.T) {
 
 		defer timer.Stop()
 
+		var done <-chan struct{}
+		if ctx != nil {
+			done = ctx.Done()
+		}
+
 		go func() {
 			select {
 			case <-timer.C:
 				vm.Interrupt("execution timeout")
-			case <-ctx.Done():
+			case <-done:
 				vm.Interrupt("context cancelled")
 			}
 		}()
