@@ -18,7 +18,6 @@ import (
 	"github.com/modfin/bellman/models/gen"
 	"github.com/modfin/bellman/prompt"
 	"github.com/modfin/bellman/tools"
-	"github.com/modfin/bellman/tools/ptc"
 )
 
 const Provider = "Bellman"
@@ -261,16 +260,8 @@ func (g *generator) Prompt(conversation ...prompt.Prompt) (*gen.Response, error)
 		Prompts: conversation,
 	}
 
-	// adapt PTC tools TODO extract separate method?
-	if len(request.Tools) > 0 {
-		config := map[string]string{"token": g.bellman.key.Token, "url": g.bellman.url}
-		regTools, ptcTool := ptc.AdaptToolsToPTC(request.Request, config)
-
-		if ptcTool != nil && len(ptcTool) > 0 {
-			request.Tools = append(regTools, ptcTool...)
-			request.SystemPrompt += ptc.GetSystemFragment()
-		}
-	}
+	// add PTC system fragment to request
+	request.SystemPrompt += g.request.PTCSystemFragment
 
 	toolBelt := map[string]*tools.Tool{}
 	for _, tool := range request.Tools {
@@ -519,16 +510,8 @@ func (g *generator) buildStreamingRequest(conversation []prompt.Prompt) (gen.Ful
 	// Ensure streaming is enabled
 	request.Stream = true
 
-	// adapt PTC tools
-	if len(request.Tools) > 0 {
-		config := map[string]string{"token": g.bellman.key.Token, "url": g.bellman.url}
-		regTools, ptcTool := ptc.AdaptToolsToPTC(request.Request, config)
-
-		if ptcTool != nil && len(ptcTool) > 0 {
-			request.Tools = append(regTools, ptcTool...)
-			request.SystemPrompt += ptc.GetSystemFragment()
-		}
-	}
+	// add PTC system fragment to request
+	request.SystemPrompt += g.request.PTCSystemFragment
 
 	// Validate request parameters for streaming
 	if err := g.validateStreamingRequest(&request); err != nil {

@@ -16,6 +16,7 @@ import (
 	"github.com/modfin/bellman/agent"
 	"github.com/modfin/bellman/models/gen"
 	"github.com/modfin/bellman/prompt"
+	"github.com/modfin/bellman/services/anthropic"
 	"github.com/modfin/bellman/services/openai"
 	"github.com/modfin/bellman/services/vertexai"
 	"github.com/modfin/bellman/tools"
@@ -31,35 +32,36 @@ func TestToolman(t *testing.T) {
 	bellmanToken := os.Getenv("BELLMAN_TOKEN")
 
 	allTools := getMockBellmanTools()
+	models := []gen.Model{openai.GenModel_gpt4o_mini, vertexai.GenModel_gemini_2_5_flash_latest, anthropic.GenModel_3_haiku_20240307}
+	//models = []gen.Model{anthropic.GenModel_3_haiku_20240307}
 
 	// create Bellman llm and run agent
 	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
-	llm := client.Generator().Model(openai.GenModel_gpt4o_mini).
-		System("## Role\nYou are a Financial Assistant. Today is 2026-02-03.").
-		SetTools(allTools...).Temperature(0).SetPTCLanguage(gen.JavaScript)
+	llm := client.Generator().System("## Role\nYou are a Financial Assistant. Today is 2026-02-03.").
+		SetTools(allTools...).SetPTCLanguage(tools.JavaScript)
 
-	const useGemini = false // quick-swap provider (gemini separate agent implementation)
-	if useGemini {
-		llm = llm.Model(vertexai.GenModel_gemini_2_5_flash_latest)
-	}
-
-	// prompt bellman
 	userPrompt := "Predict the future, convert 69 usd to sek, and then generate a secret password."
 
-	var res *agent.Result[Result]
-	switch llm.Request.Model.Provider {
-	case vertexai.Provider:
-		res, err = agent.RunWithToolsOnly[Result](10, 0, llm, prompt.AsUser(userPrompt))
-	default:
-		res, err = agent.Run[Result](10, 0, llm, prompt.AsUser(userPrompt))
-	}
+	// run all models
+	for _, m := range models {
+		// swap model
+		llm = llm.Model(m)
 
-	if err != nil {
-		log.Fatalf("Prompt() error = %v", err)
-	}
+		var res *agent.Result[Result]
+		switch llm.Request.Model.Provider {
+		case vertexai.Provider:
+			res, err = agent.RunWithToolsOnly[Result](5, 0, llm, prompt.AsUser(userPrompt))
+		default:
+			res, err = agent.Run[Result](5, 0, llm, prompt.AsUser(userPrompt))
+		}
 
-	// pretty print
-	prettyPrint(res)
+		if err != nil {
+			log.Fatalf("Prompt() error = %v", err)
+		}
+
+		// pretty print
+		prettyPrint(res)
+	}
 }
 
 func TestAutoPTC(t *testing.T) {
@@ -159,7 +161,7 @@ type Result struct {
 }
 
 func prettyPrint(res *agent.Result[Result]) {
-	fmt.Printf("==== %s ====\n", res.Metadata.Model)
+	fmt.Printf("\n==== %s ====\n", res.Metadata.Model)
 	fmt.Printf("==== Result after %d calls ====\n", res.Depth)
 	fmt.Printf("%+v\n", res.Result.Text)
 	fmt.Printf("==== Conversation ====\n")

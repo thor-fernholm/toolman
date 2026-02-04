@@ -12,20 +12,13 @@ import (
 )
 
 // adaptToolsToJSPTC converts a list of Bellman tools into a single PTC tool with JS execution environment
-func adaptToolsToJSPTC(inputTools []tools.Tool, config map[string]string) []tools.Tool {
+func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 	var descriptions []string
 
+	// instantiate goja vm
 	vm := goja.New()
-	err := vm.Set("CONFIG", map[string]string{
-		"token": config["token"],
-		"url":   config["url"],
-	})
-	if err != nil { //TODO handle error
-		fmt.Printf("could not init goja; %e", err)
-		return nil
-	}
 
-	// Helper to extract keys from schema (naive implementation)
+	// extract param keys from schema (naive implementation) TODO add type?
 	getArgKeys := func(s *schema.JSON) string {
 		if s == nil || len(s.Properties) == 0 {
 			return "{}"
@@ -41,9 +34,8 @@ func adaptToolsToJSPTC(inputTools []tools.Tool, config map[string]string) []tool
 	// register each tool in the VM and build docs
 	for _, t := range inputTools {
 		err := bindToolToJSVM(vm, t)
-		if err != nil { //TODO: handle error
-			fmt.Printf("error occurred: %e\n", err)
-			return nil
+		if err != nil {
+			return tools.Tool{}, "", fmt.Errorf("error occurred: %w", err)
 		}
 		// generate signature like: function_name({ argument })
 		argSig := getArgKeys(t.ArgumentSchema)
@@ -65,8 +57,13 @@ func adaptToolsToJSPTC(inputTools []tools.Tool, config map[string]string) []tool
 			return "", err
 		}
 
+		code, err := guardRailJS(arg.Code)
+		if err != nil {
+			return err.Error(), nil
+		}
+
 		// execute JS
-		res, err := vm.RunString(arg.Code)
+		res, err := vm.RunString(code)
 		if err != nil {
 			// return error as JSON so LLM can see it
 			return fmt.Sprintf(`{"error": %q}`, err.Error()), nil
@@ -87,14 +84,16 @@ func adaptToolsToJSPTC(inputTools []tools.Tool, config map[string]string) []tool
 	ptcTool := tools.NewTool("code_execution",
 		tools.WithDescription(
 			"MANDATORY: Executable JavaScript code ONLY. "+
-				"Combine all logic into ONE script and return an object with final results. "+
+				"Combine all logic into ONE script and return an object with final results.\n"+
+				"In the JS environment the following functions are available:\n"+
 				docsFragment,
 		),
 		tools.WithArgSchema(Args{}),
 		tools.WithFunction(executor),
 	)
 
-	return []tools.Tool{ptcTool}
+	systemFragment := "\n\n" + getSystemFragmentJS() + "\n\n" + docsFragment
+	return ptcTool, systemFragment, nil
 }
 
 // bindToolToVM wraps a Bellman tool as a JS function: toolName({ args... })
@@ -145,4 +144,64 @@ func bindToolToJSVM(vm *goja.Runtime, t tools.Tool) error {
 	}
 
 	return nil
+}
+
+// guardRailJS guardrails code before exec; important since LLMs trained for diff. coding objectives
+func guardRailJS(code string) (string, error) { // TODO: add more guardrails
+	if strings.Contains(code, "return") && !strings.HasPrefix(strings.TrimSpace(code), "(function") {
+		code = fmt.Sprintf("(function() { %s })()", code)
+	}
+
+	if strings.Contains(code, "print( ") || strings.Contains(code, "console.log(") {
+		errMsg := "RuntimeError: Log functions (e.g., 'console.log' or 'print') are strictly FORBIDDEN in this environment. You must use return data via the function return only. Rewrite the code immediately."
+		fmt.Printf("[PTC] Blocked log attempt\n")
+		return code, fmt.Errorf("error: %s", errMsg)
+	}
+
+	if strings.Contains(code, "async ") || strings.Contains(code, "await") || strings.Contains(code, "async(") {
+		errMsg := "RuntimeError: Async functions are strictly FORBIDDEN in this environment. You must use synchronous, blocking calls (e.g., 'const x = tool()', NOT 'await tool()'). Rewrite the code immediately."
+		fmt.Printf("[PTC] Blocked async code attempt\n")
+		return code, fmt.Errorf("error: %s", errMsg)
+	}
+	return code, nil
+}
+
+// getSystemFragmentJS returns system prompt fragment for JS PTC tool "code_execution"
+func getSystemFragmentJS() string {
+	return `# JavaScript Execution Environment
+You have access to a **synchronous** JavaScript runtime (goja). Use the 'code_execution' tool to solve the user's request. Assume you have all functions needed to perform the user's task'.
+
+## Strict Execution Rules
+1. **MANDATORY SYNTAX (IIFE):** You MUST wrap your entire script in an Immediately Invoked Function Expression: '(function() { ... })()'.
+   - *Reason:* This allows you to use variables, loops, and 'return' statements safely.
+   - *Warning:* Do NOT start your script with '{'. The runtime interprets this as a block, not an object, causing a syntax error.
+2. **SYNCHRONOUS ONLY:** The runtime is blocking. Usage of 'async', 'await', 'Promise' (including 'Promise.all') or '.then()' is strictly FORBIDDEN and will cause a crash.
+3. **NO CONSOLE.LOG:** The 'console' object does not exist. Usage of 'console.log' OR 'print'' will crash the runtime. Return data via the function return only.
+4. **SINGLE TURN:** Fetch all data and perform all logic in a SINGLE execution.
+5. **CALL LIMIT**: You may call code_execution ONLY ONCE per turn, so combine all tasks into a single script. You are penalized for calling code_execution multiple times.
+
+## Correct Usage Example 1
+// 1. Wrap logic in (function() { ... })()
+(function() {
+  // 2. Assign tool results to variables (Direct synchronous calls)
+  var joke = askBellman(CONFIG.url, CONFIG.token, "tell me a joke");
+  var usdAmount = convert_currency({ amount: 100, from: 'USD', to: 'SEK' });
+
+  // 3. Perform standard JS logic if needed
+  var isExpensive = usdAmount > 1000;
+
+  // 4. RETURN the final result object
+  return {
+    joke_text: joke,
+    conversion_result: usdAmount,
+    analysis: isExpensive ? "Too expensive" : "Good price"
+  };
+})()
+
+## Correct Usage Example 2
+({
+  joke: askBellman("tell me a joke"),
+  stock: getStock(id_134508u236)
+})
+`
 }

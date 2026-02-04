@@ -7,14 +7,7 @@ import (
 	"github.com/modfin/bellman/prompt"
 	"github.com/modfin/bellman/schema"
 	"github.com/modfin/bellman/tools"
-)
-
-type ProgramLanguage string // TODO move to better place?
-
-const (
-	JavaScript ProgramLanguage = "js"
-	Python     ProgramLanguage = "python"
-	Go         ProgramLanguage = "go"
+	"github.com/modfin/bellman/tools/ptc"
 )
 
 type Generator struct {
@@ -139,7 +132,25 @@ func (b *Generator) Tools() []tools.Tool {
 func (b *Generator) SetTools(tool ...tools.Tool) *Generator {
 	bb := b.clone()
 
-	bb.Request.Tools = append([]tools.Tool{}, tool...)
+	// adapt PTC tools
+	bellmanTools, PTCTools := ptc.ExtractPTCTools(tool)
+	if len(PTCTools) > 0 {
+		unifiedPTCTool, systemFragment, err := ptc.AdaptToolsToPTC(PTCTools, bb.Request.PTCLanguage)
+		if err != nil {
+			// on error; warn and resort to standard tools
+			bellmanTools = append(bellmanTools, PTCTools...)
+			bb.Request.PTCSystemFragment = ""
+		} else {
+			// add PTC tool to bellman tools and set system fragment (for PTC )
+			bellmanTools = append(bellmanTools, unifiedPTCTool)
+			bb.Request.PTCSystemFragment = systemFragment
+		}
+	} else {
+		// if no PTC tools -> set no PTC system fragment
+		bb.Request.PTCSystemFragment = ""
+	}
+
+	bb.Request.Tools = append([]tools.Tool{}, bellmanTools...)
 	return bb
 }
 func (b *Generator) AddTools(tool ...tools.Tool) *Generator {
@@ -159,9 +170,12 @@ func (b *Generator) SetToolConfig(tool tools.Tool) *Generator {
 	return bb
 }
 
-func (b *Generator) SetPTCLanguage(language ProgramLanguage) *Generator {
+func (b *Generator) SetPTCLanguage(language tools.ProgramLanguage) *Generator {
 	bb := b.clone()
 	bb.Request.PTCLanguage = language
+
+	// update PTC tools
+	b.SetTools(bb.Request.Tools...)
 
 	return bb
 }
