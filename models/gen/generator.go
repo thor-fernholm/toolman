@@ -3,9 +3,18 @@ package gen
 import (
 	"context"
 	"errors"
+
 	"github.com/modfin/bellman/prompt"
 	"github.com/modfin/bellman/schema"
 	"github.com/modfin/bellman/tools"
+)
+
+type ProgramLanguage string // TODO move to better place?
+
+const (
+	JavaScript ProgramLanguage = "js"
+	Python     ProgramLanguage = "python"
+	Go         ProgramLanguage = "go"
 )
 
 type Generator struct {
@@ -147,6 +156,13 @@ func (b *Generator) SetToolConfig(tool tools.Tool) *Generator {
 		}
 	}
 	bb.Request.Tools = []tools.Tool{tool}
+	return bb
+}
+
+func (b *Generator) SetPTCLanguage(language ProgramLanguage) *Generator {
+	bb := b.clone()
+	bb.Request.PTCLanguage = language
+
 	return bb
 }
 

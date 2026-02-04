@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"sync/atomic"
 
-	"github.com/dop251/goja"
 	"github.com/modfin/bellman/models/embed"
 	"github.com/modfin/bellman/models/gen"
 	"github.com/modfin/bellman/prompt"
@@ -264,17 +263,8 @@ func (g *generator) Prompt(conversation ...prompt.Prompt) (*gen.Response, error)
 
 	// adapt PTC tools TODO extract separate method?
 	if len(request.Tools) > 0 {
-		// create fresh vm for isolation and thread safety TODO eval other approach? and separate vms?
-		vm := goja.New()
-		err = vm.Set("CONFIG", map[string]string{
-			"token": g.bellman.key.Token,
-			"url":   g.bellman.url,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("could not init goja; %w", err)
-		}
-
-		regTools, ptcTool := ptc.AdaptToolsToPTC(vm, request.Tools, ptc.JavaScript) //TODO select language where?
+		config := map[string]string{"token": g.bellman.key.Token, "url": g.bellman.url}
+		regTools, ptcTool := ptc.AdaptToolsToPTC(request.Request, config)
 
 		if ptcTool != nil && len(ptcTool) > 0 {
 			request.Tools = append(regTools, ptcTool...)
@@ -531,17 +521,8 @@ func (g *generator) buildStreamingRequest(conversation []prompt.Prompt) (gen.Ful
 
 	// adapt PTC tools
 	if len(request.Tools) > 0 {
-		// create fresh vm for isolation and thread safety TODO eval other approach? and separate vms?
-		vm := goja.New()
-		err := vm.Set("CONFIG", map[string]string{
-			"token": g.bellman.key.Token,
-			"url":   g.bellman.url,
-		})
-		if err != nil {
-			return request, nil, fmt.Errorf("could not init goja; %w", err)
-		}
-
-		regTools, ptcTool := ptc.AdaptToolsToPTC(vm, request.Tools, ptc.JavaScript) //TODO select language where?
+		config := map[string]string{"token": g.bellman.key.Token, "url": g.bellman.url}
+		regTools, ptcTool := ptc.AdaptToolsToPTC(request.Request, config)
 
 		if ptcTool != nil && len(ptcTool) > 0 {
 			request.Tools = append(regTools, ptcTool...)
