@@ -23,11 +23,22 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 		if s == nil || len(s.Properties) == 0 {
 			return "{}"
 		}
+		// collect keys
 		var keys []string
 		for k := range s.Properties {
 			keys = append(keys, k)
 		}
-		// Returns format: { question } or { amount, from, to }
+		// build "key: type"
+		var parts []string
+		for _, k := range keys {
+			prop := s.Properties[k]
+			typeName := "any"
+			if prop.Type != "" {
+				typeName = fmt.Sprintf("%v", prop.Type)
+			}
+			parts = append(parts, fmt.Sprintf("%s: %s", k, typeName))
+		}
+		// Returns format: { question: string } or { amount: number, from: string, to: string }
 		return fmt.Sprintf("{ %s }", strings.Join(keys, ", "))
 	}
 

@@ -33,7 +33,6 @@ func TestToolman(t *testing.T) {
 
 	allTools := getMockBellmanTools()
 	models := []gen.Model{openai.GenModel_gpt4o_mini, vertexai.GenModel_gemini_2_5_flash_latest, anthropic.GenModel_3_haiku_20240307}
-	//models = []gen.Model{anthropic.GenModel_3_haiku_20240307}
 
 	// create Bellman llm and run agent
 	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
