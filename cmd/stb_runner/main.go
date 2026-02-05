@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/modfin/bellman"
 	"github.com/modfin/bellman/agent"
 	"github.com/modfin/bellman/models/gen"
@@ -22,7 +23,6 @@ import (
 	"github.com/modfin/bellman/schema"
 	"github.com/modfin/bellman/services/vertexai"
 	"github.com/modfin/bellman/tools"
-	"github.com/modfin/bellman/tools/ptc"
 )
 
 // This runner reads StableToolBench solvable_queries JSON (per group) and runs Bellman with PTC enabled.
@@ -319,14 +319,82 @@ func promptsToToolbenchConversation(systemPrompt, userQuery string, toolPrompts 
 	return conv
 }
 
+func prettyJSON(b []byte) string {
+	if len(b) == 0 {
+		return "{}"
+	}
+	var v any
+	if err := json.Unmarshal(b, &v); err != nil {
+		return string(b)
+	}
+	out, err := json.MarshalIndent(v, "", " ")
+	if err != nil {
+		return string(b)
+	}
+	return string(out)
+}
+
+func writeReadableRun(outDir string, qid int, method string, systemPrompt string, userQuery string, toolPrompts []prompt.Prompt, finalAnswer string) error {
+	var sb strings.Builder
+
+	sb.WriteString("== System Prompt ==\n")
+	sb.WriteString(systemPrompt)
+	sb.WriteString("\n\n")
+
+	sb.WriteString("== User Query ==\n")
+	sb.WriteString(userQuery)
+	sb.WriteString("\n\n")
+
+	sb.WriteString("== Tool Calls / Responses ==\n")
+	for _, p := range toolPrompts {
+		switch p.Role {
+		case prompt.ToolCallRole:
+			if p.ToolCall == nil {
+				continue
+			}
+			sb.WriteString("-- TOOL CALL --\n")
+			sb.WriteString(fmt.Sprintf("name: %s\n", p.ToolCall.Name))
+			if p.ToolCall.ToolCallID != "" {
+				sb.WriteString(fmt.Sprintf("id: %s\n", p.ToolCall.ToolCallID))
+			}
+			sb.WriteString("arguments:\n")
+			sb.WriteString(prettyJSON(p.ToolCall.Arguments))
+			sb.WriteString("\n\n")
+
+		case prompt.ToolResponseRole:
+			if p.ToolResponse == nil {
+				continue
+			}
+			sb.WriteString("-- TOOL RESPONSE --\n")
+			sb.WriteString(fmt.Sprintf("name: %s\n", p.ToolResponse.Name))
+			if p.ToolResponse.ToolCallID != "" {
+				sb.WriteString(fmt.Sprintf("tool_call_id: %s\n", p.ToolResponse.ToolCallID))
+			}
+			sb.WriteString("content:\n")
+			sb.WriteString(p.ToolResponse.Response)
+			sb.WriteString("\n\n")
+		}
+	}
+
+	sb.WriteString("== Final Answer ==\n")
+	sb.WriteString(finalAnswer)
+	sb.WriteString("\n")
+
+	// Example filename: 588_PTC@1_readable.txt
+	p := filepath.Join(outDir, fmt.Sprintf("%d_%s_readable.txt", qid, method))
+	return os.WriteFile(p, []byte(sb.String()), 0o644)
+}
+
 func main() {
+	_ = godotenv.Load(".env")
+	_ = godotenv.Load("../../.env")
 	var (
 		queriesPath    = flag.String("queries", "", "Path to StableToolBench group JSON (e.g. solvable_queries/test_instruction/G1_instruction.json)")
 		outDir         = flag.String("out", "data/answer/virtual_myptc", "Output directory")
 		method         = flag.String("method", "PTC@1", "Method name used in output filenames")
 		modelFQN       = flag.String("model", "", "Model FQN, e.g. 'ollama/llama3.1' or 'openai/gpt-4o-mini'")
-		bellmanURL     = flag.String("bellman-url", os.Getenv("BELLMAN_URL"), "Bellman proxy base URL (optional; set to use proxy)")
-		bellmanToken   = flag.String("bellman-token", os.Getenv("BELLMAN_TOKEN"), "Bellman proxy token (optional; set to use proxy)")
+		bellmanURL     = flag.String("bellman-url", os.Getenv("BELLMAN_URL"), "Bellman proxy base URL (optional; set to use proxy)")  //flag.String("bellman-url", os.Getenv("BELLMAN_URL"), "Bellman proxy base URL (optional; set to use proxy)")
+		bellmanToken   = flag.String("bellman-token", os.Getenv("BELLMAN_TOKEN"), "Bellman proxy token (optional; set to use proxy)") //flag.String("bellman-token", os.Getenv("BELLMAN_TOKEN"), "Bellman proxy token (optional; set to use proxy)")
 		googleProject  = flag.String("google-project", firstEnv("GOOGLE_CLOUD_PROJECT", "CLOUDSDK_CORE_PROJECT", "GCLOUD_PROJECT"), "GCP project id (or set GOOGLE_CLOUD_PROJECT)")
 		googleRegion   = flag.String("google-region", firstEnv("GOOGLE_CLOUD_REGION", "CLOUDSDK_COMPUTE_REGION"), "GCP region (or set GOOGLE_CLOUD_REGION). Use 'global' to reduce 429s")
 		googleCredFile = flag.String("google-credential-file", os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"), "Service account JSON file path (optional; default uses ADC)")
@@ -466,24 +534,14 @@ func main() {
 				System(*sysPrompt).
 				SetTools(queryTools...).
 				Temperature(0).
-				SetPTCLanguage(gen.JavaScript)
+				SetPTCLanguage(tools.JavaScript)
 		} else {
 			g = vertex.Generator().
 				Model(model).
 				System(*sysPrompt).
 				SetTools(queryTools...).
 				Temperature(0).
-				SetPTCLanguage(gen.JavaScript)
-
-			// Apply PTC adaptation here (normally done in the Bellman proxy client).
-			req := g.Request
-			config := map[string]string{"token": "", "url": ""}
-			regTools, ptcTools := ptc.AdaptToolsToPTC(req, config)
-			if len(ptcTools) > 0 {
-				req.Tools = append(regTools, ptcTools...)
-				req.SystemPrompt += ptc.GetSystemFragment()
-			}
-			g = g.SetConfig(req)
+				SetPTCLanguage(tools.JavaScript)
 		}
 
 		res, runErr := agent.Run[string](*maxDepth, *parallelism, g, prompt.AsUser(q.Query))
@@ -512,6 +570,11 @@ func main() {
 		b, _ := json.MarshalIndent(fileObj, "", "  ")
 		if err := os.WriteFile(outPath, b, 0o644); err != nil {
 			fmt.Fprintln(os.Stderr, "write:", err)
+			os.Exit(1)
+		}
+
+		if err := writeReadableRun(groupOutDir, q.QueryID, *method, *sysPrompt, q.Query, toolPrompts, final); err != nil {
+			fmt.Fprintln(os.Stderr, "write readable:", err)
 			os.Exit(1)
 		}
 

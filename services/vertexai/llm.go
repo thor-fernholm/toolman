@@ -28,7 +28,7 @@ type generator struct {
 func (g *generator) SetRequest(config gen.Request) {
 	g.request = config
 }
-func (g *generator) Stream(prompts ...prompt.Prompt) (<-chan *gen.StreamResponse, error) {
+func (g *generator) LStream(prompts ...prompt.Prompt) (<-chan *gen.StreamResponse, error) {
 
 	g.request.Stream = true
 	resp, model, err := g.prompt(prompts...)
@@ -98,7 +98,7 @@ func (g *generator) Stream(prompts ...prompt.Prompt) (<-chan *gen.StreamResponse
 			var ss geminiStreamingResponse
 			err = json.Unmarshal(line, &ss)
 			if err != nil {
-				log.Printf("could not unmarshal chunk, %w", err)
+				log.Printf("could not unmarshal chunk, %v", err)
 				break
 			}
 
