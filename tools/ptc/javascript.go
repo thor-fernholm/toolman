@@ -39,7 +39,7 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 			parts = append(parts, fmt.Sprintf("%s: %s", k, typeName))
 		}
 		// Returns format: { question: string } or { amount: number, from: string, to: string }
-		return fmt.Sprintf("{ %s }", strings.Join(keys, ", "))
+		return fmt.Sprintf("{ %s }", strings.Join(parts, ", "))
 	}
 
 	// register each tool in the VM and build docs
@@ -48,22 +48,20 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 		if err != nil {
 			return tools.Tool{}, "", fmt.Errorf("error occurred: %w", err)
 		}
-		// generate signature like: function_name({ argument })
+		// create signature description like: function_name({ argument: type }): description...
 		argSig := getArgKeys(t.ArgumentSchema)
-
-		// create description like: function_name({ argument }): description...
 		desc := fmt.Sprintf("- %s(%s): %s", t.Name, argSig, t.Description)
 		descriptions = append(descriptions, desc)
 	}
 
 	// define the schema for the PTC tool itself
-	type Args struct {
-		Code string `json:"code" json-description:"Executable JavaScript code using the provided functions."`
+	type CodeArgs struct {
+		Code string `json:"code" json-description:"The executable JavaScript code string."`
 	}
 
 	// create the execution function
 	executor := func(ctx context.Context, call tools.Call) (string, error) {
-		var arg Args
+		var arg CodeArgs
 		if err := json.Unmarshal(call.Argument, &arg); err != nil {
 			return "", err
 		}
@@ -77,7 +75,7 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 		res, err := vm.RunString(code)
 		if err != nil {
 			// return error as JSON so LLM can see it
-			return fmt.Sprintf(`{"error": %q}`, err.Error()), nil
+			return fmt.Sprintf(`{"error": %q. Info: Assigned variables persist in JS Environment...}`, err.Error()), nil
 		}
 
 		// export result and marshal
@@ -94,16 +92,18 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 	// create the final PTC tool
 	ptcTool := tools.NewTool("code_execution",
 		tools.WithDescription(
-			"MANDATORY: Executable JavaScript code ONLY. "+
-				"Combine all logic into ONE script and return an object with final results.\n"+
-				"In the JS environment the following functions are available:\n"+
+			"MANDATORY: Execute JavaScript code. Input must be a valid, self-contained JS string.\n"+
+				"Important: JS code is a pure function (deterministic). "+
+				"Combine all logic into ONE script. "+
+				"Returns a JSON object with results.\n"+
+				"In JavaScript environment, the following tools are available:\n"+
 				docsFragment,
 		),
-		tools.WithArgSchema(Args{}),
+		tools.WithArgSchema(CodeArgs{}),
 		tools.WithFunction(executor),
 	)
 
-	systemFragment := "\n\n" + getSystemFragmentJS() + "\n\n" + docsFragment
+	systemFragment := "\n\n" + getSystemFragmentJS() + "\n## Additional available JS tools (functions):\n" + docsFragment
 	return ptcTool, systemFragment, nil
 }
 
@@ -159,6 +159,12 @@ func bindToolToJSVM(vm *goja.Runtime, t tools.Tool) error {
 
 // guardRailJS guardrails code before exec; important since LLMs trained for diff. coding objectives
 func guardRailJS(code string) (string, error) { // TODO: add more guardrails
+	if code == "" {
+		errMsg := "RuntimeError: No code script provided. Rewrite the code immediately."
+		fmt.Printf("[PTC] Blocked empty code attempt\n")
+		return code, fmt.Errorf("error: %s", errMsg)
+	}
+
 	if strings.Contains(code, "return") && !strings.HasPrefix(strings.TrimSpace(code), "(function") {
 		code = fmt.Sprintf("(function() { %s })()", code)
 	}
@@ -181,21 +187,22 @@ func guardRailJS(code string) (string, error) { // TODO: add more guardrails
 func getSystemFragmentJS() string {
 	return `# JavaScript Execution Environment
 You have access to a **synchronous** JavaScript runtime (goja). Use the 'code_execution' tool to solve the user's request. Assume you have all functions needed to perform the user's task'.
+You can write JS code to solve tasks, and have access to standard JS functions and operations as well as some additional tools (see below), which can be used to assist or solve tasks (e.g., for math or logic problems).
 
-## Strict Execution Rules
+## Strict Execution Rules for JS Code
 1. **MANDATORY SYNTAX (IIFE):** You MUST wrap your entire script in an Immediately Invoked Function Expression: '(function() { ... })()'.
    - *Reason:* This allows you to use variables, loops, and 'return' statements safely.
    - *Warning:* Do NOT start your script with '{'. The runtime interprets this as a block, not an object, causing a syntax error.
-2. **SYNCHRONOUS ONLY:** The runtime is blocking. Usage of 'async', 'await', 'Promise' (including 'Promise.all') or '.then()' is strictly FORBIDDEN and will cause a crash.
-3. **NO CONSOLE.LOG:** The 'console' object does not exist. Usage of 'console.log' OR 'print'' will crash the runtime. Return data via the function return only.
+2. **SYNCHRONOUS ONLY:** The runtime is blocking, use syncronous functions explicitly. Important: no non-syncronous functions in goja JS.
+3. **NO CONSOLE.LOG:** The 'console' object does not exist. Usage of logging functions will crash the runtime. Return data via the function return only.
 4. **SINGLE TURN:** Fetch all data and perform all logic in a SINGLE execution.
-5. **CALL LIMIT**: You may call code_execution ONLY ONCE per turn, so combine all tasks into a single script. You are penalized for calling code_execution multiple times.
+5. **CALL LIMIT**: Important: You may call 'code_execution' ONLY ONCE per turn, so combine all tasks into a single script. You are penalized for calling 'code_execution'' multiple times.
 
-## Correct Usage Example 1
+## Correct JS code Usage Example 1
 // 1. Wrap logic in (function() { ... })()
 (function() {
   // 2. Assign tool results to variables (Direct synchronous calls)
-  var joke = askBellman(CONFIG.url, CONFIG.token, "tell me a joke");
+  var joke = askBellman("tell me a joke");
   var usdAmount = convert_currency({ amount: 100, from: 'USD', to: 'SEK' });
 
   // 3. Perform standard JS logic if needed
@@ -210,9 +217,22 @@ You have access to a **synchronous** JavaScript runtime (goja). Use the 'code_ex
 })()
 
 ## Correct Usage Example 2
-({
-  joke: askBellman("tell me a joke"),
-  stock: getStock(id_134508u236)
-})
+(function() {
+  // 1. Get initial user data by id
+  var user = get_user({ id: "u_12366226" });
+  var stock = null;
+
+  // 2. Use logic: Only fetch stock if user is premium
+  if (user && user.is_premium) {
+     company_id = get_company({ name: "example_company" })
+     stock = get_stock({ company_id: company_id });
+  }
+
+  // 3. Return combined result
+  return {
+    user_data: user,
+    comapny_stock: stock
+  };
+})()
 `
 }

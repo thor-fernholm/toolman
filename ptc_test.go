@@ -5,11 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"os"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/dop251/goja"
 	"github.com/joho/godotenv"
@@ -20,6 +17,7 @@ import (
 	"github.com/modfin/bellman/services/openai"
 	"github.com/modfin/bellman/services/vertexai"
 	"github.com/modfin/bellman/tools"
+	"github.com/modfin/bellman/tools/ptc"
 )
 
 func TestToolman(t *testing.T) {
@@ -31,15 +29,19 @@ func TestToolman(t *testing.T) {
 	bellmanUrl := os.Getenv("BELLMAN_URL")
 	bellmanToken := os.Getenv("BELLMAN_TOKEN")
 
-	allTools := getMockBellmanTools()
+	allTools := ptc.GetMockBellmanTools(true)
 	models := []gen.Model{openai.GenModel_gpt4o_mini, vertexai.GenModel_gemini_2_5_flash_latest, anthropic.GenModel_3_haiku_20240307}
 
 	// create Bellman llm and run agent
 	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
-	llm := client.Generator().System("## Role\nYou are a Financial Assistant. Today is 2026-02-03.").
-		SetTools(allTools...).SetPTCLanguage(tools.JavaScript)
+	llm := client.Generator().System("## Role\nYou are a Financial Assistant. Today is 2026-02-03. You must try your best to solve the user's requested tasks!").
+		SetTools(allTools...).SetPTCLanguage(tools.JavaScript).Temperature(0)
 
-	userPrompt := "Predict the future, convert 69 usd to sek, and then generate a secret password."
+	userPrompt := "Predict the future, convert 69 usd to sek, and then generate a secret password. "
+	//userPrompt += "Also, solve this problem: " + "Find the integer between 1 and 1,000 that produces the longest Collatz sequence. " +
+	//	"Rules:\n 1. Start with any number n.\n 2. If n is even, divide by 2.\n 3. If n is odd, multiply by 3 and add 1.\n 4. Repeat until n becomes 1." +
+	//	"\nReturn the starting number and the length of its sequence."
+	userPrompt += "also, get the stock for saab, ericsson and telia."
 
 	// run all models
 	for _, m := range models {
@@ -49,9 +51,13 @@ func TestToolman(t *testing.T) {
 		var res *agent.Result[Result]
 		switch llm.Request.Model.Provider {
 		case vertexai.Provider:
-			res, err = agent.RunWithToolsOnly[Result](5, 0, llm, prompt.AsUser(userPrompt))
+			res, err = agent.RunWithToolsOnly[Result](10, 0, llm, prompt.AsUser(userPrompt))
+		case anthropic.Provider:
+			// haiku does not support temperature=0
+			llm.Temperature(1)
+			res, err = agent.Run[Result](10, 0, llm, prompt.AsUser(userPrompt))
 		default:
-			res, err = agent.Run[Result](5, 0, llm, prompt.AsUser(userPrompt))
+			res, err = agent.Run[Result](10, 0, llm, prompt.AsUser(userPrompt))
 		}
 
 		if err != nil {
@@ -83,7 +89,7 @@ func TestAutoPTC(t *testing.T) {
 	})
 
 	// define bellman tools
-	mockTools := getMockBellmanTools()
+	mockTools := ptc.GetMockBellmanTools(true)
 	//regularTools, PTCTools := ptc.AdaptToolsToPTC(vm, mockTools, gen.JavaScript)
 	//allTools := append(regularTools, PTCTools...)
 
@@ -92,22 +98,7 @@ func TestAutoPTC(t *testing.T) {
 You are a Financial Assistant. Today is 2026-02-03.
 
 ## Capabilities
-You solve complex logic by writing JavaScript code for the code_execution tool.
-
-## Rules for code_execution
-1. CALL LIMIT: You may call code_execution ONLY ONCE per turn. 
-2. LOGIC: Perform all calculations and multi-tool logic INSIDE the JS script. Before calling code_execution, plan how to combine all tasks into a single script. You are penalized for making more than one tool call.
-3. RETURN: The JS script MUST end with an object containing all final data.
-4. FORMAT: Do not use console.log for final data; the last evaluated expression is the return value.
-6. SYNTHESIS: Once you have the result from code_execution, you have everything you need. 
-7. TERMINATION: Do not call the tool again with the same or modified code.
-8. SYNC: Do not use async functions unless specified.
-
-## Example JS Script Input
-({
-  joke: askBellman(CONFIG.url, CONFIG.token, ""),
-  total: Sum(123, 456)
-})`
+You solve complex logic by writing JavaScript code for the code_execution tool.`
 
 	// create Bellman llm and run agent
 	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
@@ -122,9 +113,7 @@ You solve complex logic by writing JavaScript code for the code_execution tool.
 
 	// prompt, expected result --> <bad-bellman-joke> and 2222222211
 	userPrompt := "Predict the future, convert 69 usd to sek, and then generate a secret password."
-	type Result struct {
-		Text string `json:"text" json-description:"The final natural text answer to the user's request."`
-	}
+
 	var res *agent.Result[Result]
 	switch llm.Request.Model.Provider {
 	case vertexai.Provider:
@@ -138,21 +127,7 @@ You solve complex logic by writing JavaScript code for the code_execution tool.
 	}
 
 	// pretty print
-	fmt.Printf("==== %s ====\n", res.Metadata.Model)
-	fmt.Printf("==== Result after %d calls ====\n", res.Depth)
-	fmt.Printf("%+v\n", res.Result.Text)
-	fmt.Printf("==== Conversation ====\n")
-
-	for _, p := range res.Prompts {
-		switch p.Role {
-		case prompt.ToolCallRole:
-			fmt.Printf("%s: %s\n", p.Role, *p.ToolCall)
-		case prompt.ToolResponseRole:
-			fmt.Printf("%s: %s\n", p.Role, *p.ToolResponse)
-		default:
-			fmt.Printf("%s: %s\n", p.Role, p.Text)
-		}
-	}
+	prettyPrint(res)
 }
 
 type Result struct {
@@ -163,6 +138,10 @@ func prettyPrint(res *agent.Result[Result]) {
 	fmt.Printf("\n==== %s ====\n", res.Metadata.Model)
 	fmt.Printf("==== Result after %d calls ====\n", res.Depth)
 	fmt.Printf("%+v\n", res.Result.Text)
+	fmt.Printf("==== Used %d tokens ====\n", res.Metadata.TotalTokens)
+	costLow := (float64(res.Metadata.InputTokens)*0.15 + float64(res.Metadata.OutputTokens)*0.60) / 1_000_000.0
+	costHigh := (float64(res.Metadata.InputTokens)*0.30 + float64(res.Metadata.OutputTokens)*2.50) / 1_000_000.0
+	fmt.Printf("approx. $%.4f - $%.4f\n", costLow, costHigh)
 	fmt.Printf("==== Conversation ====\n")
 
 	for _, p := range res.Prompts {
@@ -175,101 +154,6 @@ func prettyPrint(res *agent.Result[Result]) {
 			fmt.Printf("%s: %s\n", p.Role, p.Text)
 		}
 	}
-}
-
-// getMockBellmanTools returns a slice of 3 ready-to-use Bellman tools
-func getMockBellmanTools() []tools.Tool {
-	var mockTools []tools.Tool
-
-	// 1. Magic 8-Ball Tool
-	type FutureArgs struct {
-		Question string `json:"question"`
-	}
-	predictTool := tools.NewTool("predict_future",
-		tools.WithDescription("Returns a mystical answer to a yes/no question."),
-		tools.WithArgSchema(FutureArgs{}),
-		tools.WithPTC(true),
-		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
-			var arg FutureArgs
-			if err := json.Unmarshal(call.Argument, &arg); err != nil {
-				return "", err
-			}
-
-			// Logic
-			answers := []string{
-				"It is certain.", "Reply hazy, try again.", "Don't count on it.",
-				"The stars say yes.", "My sources say no.",
-			}
-			rand.Seed(time.Now().UnixNano())
-			return answers[rand.Intn(len(answers))], nil
-		}),
-	)
-	mockTools = append(mockTools, predictTool)
-
-	// 2. Currency Converter Tool
-	type CurrencyArgs struct {
-		Amount float64 `json:"amount"`
-		From   string  `json:"from"`
-		To     string  `json:"to"`
-	}
-	convertTool := tools.NewTool("convert_currency",
-		tools.WithDescription("Converts currency amounts (USD, EUR, SEK, GBP, JPY)."),
-		tools.WithArgSchema(CurrencyArgs{}),
-		tools.WithPTC(true),
-		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
-			var arg CurrencyArgs
-			if err := json.Unmarshal(call.Argument, &arg); err != nil {
-				return "", err
-			}
-
-			// Logic
-			rates := map[string]float64{"USD": 1.0, "EUR": 0.92, "SEK": 10.50, "GBP": 0.79, "JPY": 148.0}
-			rateFrom, ok1 := rates[strings.ToUpper(arg.From)]
-			rateTo, ok2 := rates[strings.ToUpper(arg.To)]
-
-			if !ok1 || !ok2 {
-				return fmt.Sprintf("Error: Unknown currency pair %s -> %s", arg.From, arg.To), nil
-			}
-			result := (arg.Amount / rateFrom) * rateTo
-			return fmt.Sprintf("%.2f", result), nil
-		}),
-	)
-	mockTools = append(mockTools, convertTool)
-
-	// 3. Password Generator Tool
-	type PasswordArgs struct {
-		Length  int  `json:"length"`
-		Special bool `json:"special"`
-	}
-	passTool := tools.NewTool("generate_password",
-		tools.WithDescription("Generates a random string. 'special' adds symbols."),
-		tools.WithArgSchema(PasswordArgs{}),
-		tools.WithPTC(true),
-		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
-			var arg PasswordArgs
-			if err := json.Unmarshal(call.Argument, &arg); err != nil {
-				return "", err
-			}
-
-			// Logic
-			if arg.Length > 50 {
-				return "Error: Password too long!", nil
-			}
-			chars := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-			if arg.Special {
-				chars += "!@#$%^&*()_+"
-			}
-			var result strings.Builder
-			for i := 0; i < arg.Length; i++ {
-				idx := (i * 7) % len(chars) // Mock deterministic random
-				result.WriteByte(chars[idx])
-			}
-			return result.String(), nil
-		}),
-	)
-	mockTools = append(mockTools, passTool)
-
-	return mockTools
 }
 
 func TestMockPTC(t *testing.T) {
