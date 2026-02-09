@@ -190,7 +190,7 @@ func newAPITool(rec apiListRecord, virtualURL, toolbenchKey string) tools.Tool {
 
 	t := tools.NewTool(fnName,
 		tools.WithDescription(desc),
-		tools.WithPTC(true),
+		tools.WithPTC(false),
 		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
 			// call.Argument is JSON of the argument object
 			var args map[string]any
@@ -311,12 +311,41 @@ func promptsToToolbenchConversation(systemPrompt, userQuery string, toolPrompts 
 			// ignore user/assistant text prompts here; we record only tool call/resp
 		}
 	}
+	/*
+		conv = append(conv, map[string]any{
+			"role":    "assistant",
+			"content": finalAnswer,
+		})
+	*/
+	finishArgs, _ := json.Marshal(map[string]any{
+		"final_answer": finalAnswer,
+	})
+
+	autoID++
+	finishID := fmt.Sprintf("call_%d", autoID)
 
 	conv = append(conv, map[string]any{
-		"role":    "assistant",
-		"content": finalAnswer,
+		"role": "assistant",
+		"tool_calls": []map[string]any{
+			{
+				"id":   finishID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      "Finish",
+					"arguments": string(finishArgs),
+				},
+			},
+		},
 	})
+
+	conv = append(conv, map[string]any{
+		"role":         "tool",
+		"tool_call_id": finishID,
+		"content":      "",
+	})
+
 	return conv
+
 }
 
 func prettyJSON(b []byte) string {
@@ -406,6 +435,7 @@ func main() {
 		offset         = flag.Int("offset", 0, "Offset into query list")
 		sysPrompt      = flag.String("system", "You are a helpful assistant.", "Base system prompt")
 	)
+
 	flag.Parse()
 
 	if *queriesPath == "" {

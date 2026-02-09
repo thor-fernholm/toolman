@@ -7,15 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/modfin/bellman/models"
-	"github.com/modfin/bellman/models/gen"
-	"github.com/modfin/bellman/prompt"
-	"github.com/modfin/bellman/tools"
 	"io"
 	"log"
 	"net/http"
 	"sync/atomic"
 	"time"
+
+	"github.com/modfin/bellman/models"
+	"github.com/modfin/bellman/models/gen"
+	"github.com/modfin/bellman/prompt"
+	"github.com/modfin/bellman/tools"
 )
 
 var requestNo int64
@@ -28,7 +29,7 @@ type generator struct {
 func (g *generator) SetRequest(config gen.Request) {
 	g.request = config
 }
-func (g *generator) LStream(prompts ...prompt.Prompt) (<-chan *gen.StreamResponse, error) {
+func (g *generator) Stream(prompts ...prompt.Prompt) (<-chan *gen.StreamResponse, error) {
 
 	g.request.Stream = true
 	resp, model, err := g.prompt(prompts...)
