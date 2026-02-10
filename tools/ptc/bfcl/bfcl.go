@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/dop251/goja"
@@ -42,6 +41,8 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 		if tDef.Name == "" {
 			continue
 		}
+
+		//fmt.Printf("tool (%v) desc: %s", i, tDef.Description)
 
 		// OpenAI rejects dots. "math.factorial" -> "math_factorial"
 		sanitizedName := invalidNameChars.ReplaceAllString(tDef.Name, "_")
@@ -103,12 +104,12 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 func createEchoFunction(name string) func(context.Context, tools.Call) (string, error) {
 	return func(ctx context.Context, call tools.Call) (string, error) {
 		var args map[string]interface{}
-		// 1. safe unmarshal
+		// safe unmarshal
 		if err := json.Unmarshal(call.Argument, &args); err != nil {
 			return "", err
 		}
 
-		// 2. build string manually, avoiding fmt.Sprintf("%v") on complex nested maps
+		// build string manually, avoiding fmt.Sprintf("%v") on complex nested maps
 		// which can trigger recursive String() methods if you have custom types
 		var parts []string
 		for k, v := range args {
@@ -133,11 +134,11 @@ func createEchoFunction(name string) func(context.Context, tools.Call) (string, 
 }
 
 // GetToolCalls extracts calls in the Ground Truth format: [{"func": {"arg": val}}]
-func GetToolCalls(res *gen.Response, availableTools []tools.Tool) []ExtractedCall {
+func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCall, error) {
 	var calls []ExtractedCall
 
 	if !res.IsTools() {
-		return calls
+		return calls, nil
 	}
 
 	for _, tool := range res.Tools {
@@ -156,6 +157,7 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) []ExtractedCal
 					// Note: execResult.FinalReturn is available here if you need it later
 				} else {
 					fmt.Printf("Error extracting PTC calls: %v\n", err)
+					return nil, err
 				}
 			}
 			continue
@@ -178,7 +180,7 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) []ExtractedCal
 		calls = append(calls, entry)
 	}
 
-	return calls
+	return calls, nil
 }
 
 // ExtractedCall: The structure of a single tool call found during execution
@@ -186,8 +188,8 @@ type ExtractedCall map[string]map[string]interface{}
 
 // ExecutionResult holds both the calls found and the final return value of the script
 type ExecutionResult struct {
-	Calls       []ExtractedCall `json:"tool_calls"`
-	FinalReturn interface{}     `json:"final_return"`
+	Calls []ExtractedCall `json:"tool_calls"`
+	//FinalReturn interface{}     `json:"final_return"`
 }
 
 func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) (*ExecutionResult, error) {
@@ -211,40 +213,26 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) (*ExecutionRe
 				}
 			}
 
+			//fmt.Printf(" ##### goja function call args: %+v\n arg map: %+v\n", call.Arguments, argsMap)
+
 			// Record the call
 			capturedCalls = append(capturedCalls, ExtractedCall{
 				tName: argsMap,
 			})
 
-			// Return a "Happy Path" Mock Object <-- needed?!
-			// This ensures 'var user = ...' gets a value, and 'if (user.is_premium)' works.
-			// In a real agent, you might want to inject specific mocks per tool.
-			mockReturn := map[string]interface{}{
-				"id":         "mock_id_123", // satisfies generic usage
-				"is_premium": true,          // HIT THE LOGIC BRANCH (Example 2)
-				"amount":     5000,          // HIT THE LOGIC BRANCH (Example 1: > 1000)
-				"status":     "success",     // generic field
-				"result":     "mock_string", // generic field
-			}
-
-			return vm.ToValue(mockReturn)
+			return vm.ToValue("mock_return")
 		}
-
-		if err := registerFunctionPath(vm, tName, interceptor); err != nil {
-			return nil, fmt.Errorf("failed to register tool %s: %w", tName, err)
-		}
+		vm.Set(tName, interceptor)
 	}
 
-	val, err := vm.RunString(jsCode)
+	_, err := vm.RunString(jsCode)
 	if err != nil {
-		return nil, fmt.Errorf("runtime error: %w", err)
+		// Log it for debugging, but DO NOT return nil
+		fmt.Printf("Partial Extraction (Runtime Error): %v\n", err)
 	}
-
-	finalRet := val.Export()
 
 	return &ExecutionResult{
-		Calls:       capturedCalls,
-		FinalReturn: finalRet,
+		Calls: capturedCalls,
 	}, nil
 }
 
@@ -276,52 +264,38 @@ func registerFunctionPath(vm *goja.Runtime, path string, fn func(goja.FunctionCa
 	return currentObj.Set(parts[len(parts)-1], fn)
 }
 
-func FormatAsPythonCall(name string, args map[string]interface{}) string {
-	var parts []string
-	for k, v := range args {
-		valStr := ""
-
-		switch val := v.(type) {
-		case string:
-			valStr = fmt.Sprintf("'%s'", val)
-		case bool:
-			if val {
-				valStr = "True"
-			} else {
-				valStr = "False"
-			}
-		case nil:
-			valStr = "None"
-		default:
-			b, _ := json.Marshal(v)
-			valStr = string(b)
-		}
-
-		if strings.HasPrefix(valStr, "[") && strings.HasSuffix(valStr, "]") {
-			var list []interface{}
-			if err := json.Unmarshal([]byte(valStr), &list); err == nil && len(list) == 1 {
-				inner := list[0]
-				switch innerVal := inner.(type) {
-				case string:
-					valStr = fmt.Sprintf("'%s'", innerVal)
-				case bool:
-					if innerVal {
-						valStr = "True"
-					} else {
-						valStr = "False"
-					}
-				default:
-					b, _ := json.Marshal(inner)
-					valStr = string(b)
-				}
-			}
-		}
-
-		parts = append(parts, fmt.Sprintf("%s=%s", k, valStr))
+func ParsePythonCall(content string) (string, string) {
+	// Simple heuristic: split on the first '('
+	idx := strings.Index(content, "(")
+	if idx == -1 {
+		// Fallback: Not a valid call format, return whole content as name
+		return content, "{}"
 	}
 
-	// Sort args for stability (optional but good for debugging)
-	sort.Strings(parts)
+	name := strings.TrimSpace(content[:idx])
 
-	return fmt.Sprintf("%s(%s)", name, strings.Join(parts, ", "))
+	// Args: everything between the first '(' and the last ')'
+	args := content[idx+1:]
+	if lastIdx := strings.LastIndex(args, ")"); lastIdx != -1 {
+		args = args[:lastIdx]
+	}
+
+	// OpenAI expects arguments to be a JSON string.
+	// Since 'args' here is Python syntax (e.g. "a=1, b='str'"),
+	// STRICTLY speaking, we should convert it to JSON "{"a": 1, "b": "str"}".
+	//
+	// HOWEVER, for context history, many models are forgiving if you just pass
+	// a string representation or a dummy JSON object if you can't parse it.
+	//
+	// Better strategy: Wrap the Python args in a fake JSON wrapper if strictly needed,
+	// or return it as is if the model tolerates it.
+	// Let's return a JSON string wrapping the raw text to be safe(ish).
+	// Or, if your "ptc" package has a converter, use that.
+
+	// For now, let's try to wrap it in a single "arg" string to ensure valid JSON
+	// so the API doesn't reject it as malformed JSON.
+	// Result: {"__raw_python_args__": "base=10, height=5"}
+	safeArgs := fmt.Sprintf(`{"__raw_args__": "%s"}`, strings.ReplaceAll(args, `"`, `\"`))
+
+	return name, safeArgs
 }

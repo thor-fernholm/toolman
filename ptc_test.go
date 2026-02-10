@@ -34,14 +34,15 @@ func TestToolman(t *testing.T) {
 
 	// create Bellman llm and run agent
 	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
-	llm := client.Generator().System("## Role\nYou are a Financial Assistant. Today is 2026-02-03. You must try your best to solve the user's requested tasks!").
+	llm := client.Generator().System("## Role\nYou are a Financial Assistant. You are an LLM with access to tools, one of which is PTC. Today is 2026-02-03. You must try your best to solve the user's requested tasks!").
 		SetTools(allTools...).SetPTCLanguage(tools.JavaScript).Temperature(0)
 
-	userPrompt := "Predict the future, convert 69 usd to sek, and then generate a secret password. "
+	userPrompt := "1. Do you know what PTC is, and how LLMs call tools? If yes; answer me which tool at your disposal is PTC. If no; why not?"
+	userPrompt += "2. Predict the future, 3. convert 69 usd to sek, and then 4. generate a secret password. "
 	//userPrompt += "Also, solve this problem: " + "Find the integer between 1 and 1,000 that produces the longest Collatz sequence. " +
 	//	"Rules:\n 1. Start with any number n.\n 2. If n is even, divide by 2.\n 3. If n is odd, multiply by 3 and add 1.\n 4. Repeat until n becomes 1." +
 	//	"\nReturn the starting number and the length of its sequence."
-	userPrompt += "also, get the stock for saab, ericsson and telia."
+	userPrompt += "also, 5. get the stock for saab, ericsson and telia."
 
 	// run all models
 	for _, m := range models {
@@ -62,6 +63,10 @@ func TestToolman(t *testing.T) {
 
 		if err != nil {
 			log.Fatalf("Prompt() error = %v", err)
+		}
+
+		for i, m := range res.Prompts {
+			fmt.Printf("prompt %v: { role: %v, text: %v, tool_call: %v, tool_response: %v }\n", i, m.Role, m.Text, m.ToolCall, m.ToolResponse)
 		}
 
 		// pretty print
@@ -124,6 +129,10 @@ You solve complex logic by writing JavaScript code for the code_execution tool.`
 
 	if err != nil {
 		log.Fatalf("Prompt() error = %v", err)
+	}
+
+	for i, m := range res.Prompts {
+		fmt.Printf("prompt %v: %v\n", i, m)
 	}
 
 	// pretty print
