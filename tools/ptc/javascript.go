@@ -50,7 +50,7 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 		}
 		// create signature description like: function_name({ argument: type }): description...
 		argSig := getArgKeys(t.ArgumentSchema)
-		desc := fmt.Sprintf("- %s(%s): %s", t.Name, argSig, t.Description)
+		desc := fmt.Sprintf(" - %s(%s): %s", t.Name, argSig, t.Description)
 		descriptions = append(descriptions, desc)
 	}
 
@@ -185,54 +185,63 @@ func guardRailJS(code string) (string, error) { // TODO: add more guardrails
 
 // getSystemFragmentJS returns system prompt fragment for JS PTC tool "code_execution"
 func getSystemFragmentJS() string {
-	return `# JavaScript Execution Environment
-You have access to a **synchronous** JavaScript runtime (goja). Use the 'code_execution' tool to solve the user's request. Assume you have all functions needed to perform the user's task'.
-You can write JS code to solve tasks, and have access to standard JS functions and operations as well as some additional tools (see below), which can be used to assist or solve tasks (e.g., for math or logic problems).
+	return `# JavaScript Tool Execution Environment (Goja)
 
-## Strict Execution Rules for JS Code
-1. **MANDATORY SYNTAX (IIFE):** You MUST wrap your entire script in an Immediately Invoked Function Expression: '(function() { ... })()'.
-   - *Reason:* This allows you to use variables, loops, and 'return' statements safely.
-   - *Warning:* Do NOT start your script with '{'. The runtime interprets this as a block, not an object, causing a syntax error.
-2. **SYNCHRONOUS ONLY:** The runtime is blocking, use syncronous functions explicitly. Important: no non-syncronous functions in goja JS.
-3. **NO CONSOLE.LOG:** The 'console' object does not exist. Usage of logging functions will crash the runtime. Return data via the function return only.
-4. **SINGLE TURN:** Fetch all data and perform all logic in a SINGLE execution.
-5. **CALL LIMIT**: Important: You may call 'code_execution' ONLY ONCE per turn, so combine all tasks into a single script. You are penalized for calling 'code_execution'' multiple times.
+You are running inside a minimal, embedded JavaScript runtime (Goja).
+This environment is NOT Node.js, NOT a browser, and NOT standard JavaScript.
 
-## Correct JS code Usage Example 1
-// 1. Wrap logic in (function() { ... })()
+## Environment Constraints (CRITICAL)
+The following APIs and capabilities DO NOT exist:
+- require
+- import
+- fs, path, os, process, Buffer
+- DOM, window, or browser APIs
+- console or logging
+- async functions, promises, or callbacks
+- global utilities unless explicitly listed
+
+If a function or object is not explicitly listed in the tool section, it does not exist.
+Calling an undefined function will cause execution failure.
+
+## Available Capabilities
+You may ONLY:
+- Use basic JavaScript syntax (variables, conditionals, loops, arrays, objects)
+- Call explicitly listed tool functions
+- Return data using return only
+
+All I/O, filesystem access, networking, and side effects MUST be performed
+through provided tool functions.
+
+## Mandatory Execution Rules
+1. Single IIFE required
+All code MUST be wrapped in exactly one Immediately Invoked Function Expression:
+(function() { ... })()
+
+2. Synchronous execution only
+All tool calls are blocking and synchronous.
+
+3. Single execution
+You may call code_execution exactly once per turn.
+
+4. Return-only output
+Do not log or print. The returned value is the final output.
+
+## Tool Usage Rules (IMPORTANT)
+- File operations must use file-related tools
+- Network operations must use network tools
+- Data retrieval must use provided fetch tools
+
+Never invent, assume, or simulate APIs.
+
+If no appropriate tool exists for a required operation, return an object
+explaining the limitation instead of attempting unsupported JavaScript.
+
+## Correct Example
 (function() {
-  // 2. Assign tool results to variables (Direct synchronous calls)
-  var joke = askBellman("tell me a joke");
-  var usdAmount = convert_currency({ amount: 100, from: 'USD', to: 'SEK' });
-
-  // 3. Perform standard JS logic if needed
-  var isExpensive = usdAmount > 1000;
-
-  // 4. RETURN the final result object
-  return {
-    joke_text: joke,
-    conversion_result: usdAmount,
-    analysis: isExpensive ? "Too expensive" : "Good price"
-  };
-})()
-
-## Correct Usage Example 2
-(function() {
-  // 1. Get initial user data by id
-  var user = get_user({ id: "u_12366226" });
-  var stock = null;
-
-  // 2. Use logic: Only fetch stock if user is premium
-  if (user && user.is_premium) {
-     company_id = get_company({ name: "example_company" })
-     stock = get_stock({ company_id: company_id });
-  }
-
-  // 3. Return combined result
-  return {
-    user_data: user,
-    comapny_stock: stock
-  };
+  var file = read_file({ path: "final_report.pdf" });
+  write_file({ path: "temp/final_report.pdf", data: file });
+  var file_status = get_status({ data: file })
+  return { status: file_status };
 })()
 `
 }

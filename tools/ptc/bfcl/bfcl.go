@@ -150,15 +150,9 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCa
 			// Unmarshal the 'argument' string/bytes to get the JS code
 			if err := json.Unmarshal(tool.Argument, &codeArgs); err == nil {
 				// Run the Extractor
-				execResult, err := ExecuteAndExtract(codeArgs.Code, availableTools)
-				if err == nil {
-					// Append all calls found in the JS code
-					calls = append(calls, execResult.Calls...)
-					// Note: execResult.FinalReturn is available here if you need it later
-				} else {
-					fmt.Printf("Error extracting PTC calls: %v\n", err)
-					return nil, err
-				}
+				execResult := ExecuteAndExtract(codeArgs.Code, availableTools)
+				// Append all calls found in the JS code
+				calls = append(calls, execResult.Calls...)
 			}
 			continue
 		}
@@ -192,9 +186,34 @@ type ExecutionResult struct {
 	//FinalReturn interface{}     `json:"final_return"`
 }
 
-func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) (*ExecutionResult, error) {
+func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionResult {
+	// GLOBAL SAFETY: Recover from any internal Panic
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("Critical Panic in Interpreter: %v\n", r)
+		}
+	}()
+
 	vm := goja.New()
 	var capturedCalls []ExtractedCall
+
+	// TIMEOUT SAFETY: Prevent infinite loops (e.g. while(true))
+	// Interrupt execution after 500ms.
+	timer := time.AfterFunc(500*time.Millisecond, func() {
+		vm.Interrupt("timeout")
+	})
+	defer timer.Stop()
+
+	// POLYFILLS: Prevent ReferenceErrors for common globals TODO remove?
+	// LLMs often treat 'console' and 'print' as standard.
+	dummyFunc := func(call goja.FunctionCall) goja.Value { return vm.ToValue(nil) }
+	vm.Set("print", dummyFunc)
+
+	console := vm.NewObject()
+	console.Set("log", dummyFunc)
+	console.Set("error", dummyFunc)
+	console.Set("warn", dummyFunc)
+	vm.Set("console", console)
 
 	for _, tool := range availableTools {
 		tName := tool.Name
@@ -202,100 +221,55 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) (*ExecutionRe
 		// INTERCEPTOR: Runs when JS calls a tool
 		interceptor := func(call goja.FunctionCall) goja.Value {
 			argsMap := make(map[string]interface{})
-			// Extract Arguments
+			// ROBUST ARG PARSING: Handle any argument style
 			if len(call.Arguments) > 0 {
-				if obj, ok := call.Arguments[0].Export().(map[string]interface{}); ok {
+				firstArg := call.Arguments[0].Export()
+
+				// Scenario A: Standard BFCL (First arg is a Dictionary)
+				// tool({ "arg": 1 })
+				if obj, ok := firstArg.(map[string]interface{}); ok {
 					for k, v := range obj {
-						// CHANGE: Force wrap the value in a list
-						//argsMap[k] = ensureList(v)
 						argsMap[k] = v
+					}
+				} else {
+					// Scenario B: Hallucinated Positional Args
+					// tool("value", 123)
+					// We capture them with generic keys so we don't lose data.
+					argsMap["__arg_0__"] = firstArg
+					for i := 1; i < len(call.Arguments); i++ {
+						fmt.Printf("[Fix] caught a previous js extract error...")
+						key := fmt.Sprintf("__arg_%d__", i)
+						argsMap[key] = call.Arguments[i].Export()
 					}
 				}
 			}
-
-			//fmt.Printf(" ##### goja function call args: %+v\n arg map: %+v\n", call.Arguments, argsMap)
 
 			// Record the call
 			capturedCalls = append(capturedCalls, ExtractedCall{
 				tName: argsMap,
 			})
 
+			// Return mock to keep script running
 			return vm.ToValue("mock_return")
 		}
 		vm.Set(tName, interceptor)
 	}
 
 	_, err := vm.RunString(jsCode)
+
+	// GRACEFUL FAILURE
+	// If we crash (e.g. syntax error), we STILL return whatever calls we captured.
 	if err != nil {
-		// Log it for debugging, but DO NOT return nil
-		fmt.Printf("Partial Extraction (Runtime Error): %v\n", err)
+		// Check if it was just our timeout
+		var evalErr *goja.InterruptedError
+		if !errors.As(err, &evalErr) {
+			// If it's a real runtime error, just log it.
+			// We DO NOT return the error to the caller, because we want the partial results.
+			fmt.Printf("JS Runtime Warning: %v\n", err)
+		}
 	}
 
 	return &ExecutionResult{
 		Calls: capturedCalls,
-	}, nil
-}
-
-// ... registerFunctionPath (Same as before) ...
-func registerFunctionPath(vm *goja.Runtime, path string, fn func(goja.FunctionCall) goja.Value) error {
-	parts := strings.Split(path, ".")
-	if len(parts) == 1 {
-		vm.Set(path, fn)
-		return nil
 	}
-	currentObj := vm.GlobalObject()
-	for i := 0; i < len(parts)-1; i++ {
-		part := parts[i]
-		val := currentObj.Get(part)
-		if val == nil || goja.IsUndefined(val) {
-			newObj := vm.NewObject()
-			if err := currentObj.Set(part, newObj); err != nil {
-				return err
-			}
-			currentObj = newObj
-		} else {
-			obj := val.ToObject(vm)
-			if obj == nil {
-				return fmt.Errorf("namespace collision: %s is not an object", part)
-			}
-			currentObj = obj
-		}
-	}
-	return currentObj.Set(parts[len(parts)-1], fn)
-}
-
-func ParsePythonCall(content string) (string, string) {
-	// Simple heuristic: split on the first '('
-	idx := strings.Index(content, "(")
-	if idx == -1 {
-		// Fallback: Not a valid call format, return whole content as name
-		return content, "{}"
-	}
-
-	name := strings.TrimSpace(content[:idx])
-
-	// Args: everything between the first '(' and the last ')'
-	args := content[idx+1:]
-	if lastIdx := strings.LastIndex(args, ")"); lastIdx != -1 {
-		args = args[:lastIdx]
-	}
-
-	// OpenAI expects arguments to be a JSON string.
-	// Since 'args' here is Python syntax (e.g. "a=1, b='str'"),
-	// STRICTLY speaking, we should convert it to JSON "{"a": 1, "b": "str"}".
-	//
-	// HOWEVER, for context history, many models are forgiving if you just pass
-	// a string representation or a dummy JSON object if you can't parse it.
-	//
-	// Better strategy: Wrap the Python args in a fake JSON wrapper if strictly needed,
-	// or return it as is if the model tolerates it.
-	// Let's return a JSON string wrapping the raw text to be safe(ish).
-	// Or, if your "ptc" package has a converter, use that.
-
-	// For now, let's try to wrap it in a single "arg" string to ensure valid JSON
-	// so the API doesn't reject it as malformed JSON.
-	// Result: {"__raw_python_args__": "base=10, height=5"}
-	safeArgs := fmt.Sprintf(`{"__raw_args__": "%s"}`, strings.ReplaceAll(args, `"`, `\"`))
-
-	return name, safeArgs
 }

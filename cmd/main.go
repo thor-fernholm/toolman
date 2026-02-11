@@ -56,7 +56,21 @@ func main() {
 		panic(err)
 	}
 
-	http.HandleFunc("/bfcl", handleGenerateBFCL)
+	//http.HandleFunc("/bfcl", handleGenerateBFCL)
+
+	// Register API Endpoint
+	http.HandleFunc("/bfcl", bfcl.MiddlewareDebugLogger(handleGenerateBFCL))
+
+	// Register Debug UI Endpoints
+	http.HandleFunc("/debug", bfcl.HandleDebugUI)
+	http.HandleFunc("/debug/api/data", bfcl.HandleDebugData)
+	http.HandleFunc("/debug/api/clear", bfcl.HandleDebugClear)
+
+	fmt.Println("---------------------------------------------------------")
+	fmt.Println(" Toolman Server Running")
+	fmt.Println(" API Endpoint:   http://localhost:8080/bfcl")
+	fmt.Println(" Debug UI:       http://localhost:8080/debug")
+	fmt.Println("---------------------------------------------------------")
 
 	fmt.Println("Toolman Benchmark Server running on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
@@ -80,38 +94,27 @@ func handleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 	bellmanToken := os.Getenv("BELLMAN_TOKEN")
 	client := bellman.New(bellmanUrl, bellman.Key{Name: "bfcl", Token: bellmanToken})
 
-	//fmt.Printf("\nSystem prompt: %s\n\n", req.SystemPrompt)
-
-	//fmt.Println("Request tools: %v", req.Tools)
 	bfclTools := bfcl.ParseJsonSchemaTools(req.Tools, req.EnablePTC)
-	//fmt.Printf("\n---------- conversation...\n")
-	//for i, m := range req.Messages {
-	//	fmt.Printf("msg %v: %v\n", i, m)
-	//}
 
 	toolmanHistory := req.ToolmanHistory
-	// add trailing messages
-	for i, m := range req.Messages {
+
+	// count toolman user messages
+	toolmanUserCount := 0
+	for _, p := range toolmanHistory {
+		if p.Role == prompt.UserRole {
+			toolmanUserCount++
+		}
+	}
+	// add trailing messages from BFCL
+	bfclUserCount := 0
+	for _, m := range req.Messages {
 		switch m.Role {
-		//case "tool_response":
-		//	// overwrite previous tool with same id (same ptc call)
-		//	if messages[len(messages)-1].ToolCall.ToolCallID == m.ToolID {
-		//		messages[len(messages)-1] = prompt.AsToolResponse(m.ToolID, "code_execution", m.Content) // Important: this should always be code_execution tool
-		//	} else {
-		//		messages = append(messages, prompt.AsToolResponse(m.ToolID, "code_execution", m.Content))
-		//	}
 		case "user":
-			// add trailing user message (last message in conversation) // TODO can be multiple...
-			if i == len(req.Messages)-1 {
-				fmt.Printf("Adding trailing user msg: %+v\n", m)
+			// only add new user messages from bfcl (not in toolman hist.)
+			bfclUserCount++
+			if bfclUserCount > toolmanUserCount {
 				toolmanHistory = append(toolmanHistory, prompt.AsUser(m.Content))
 			}
-			//case "assistant": // don't think this is needed as assistant --> final response?
-			//	if i >= len(messages) {
-			//		fmt.Printf("Adding trailing assistant msg: %+v\n", m)
-			//
-			//		messages = append(messages, prompt.AsAssistant(m.Content))
-			//	}
 		}
 	}
 
@@ -130,18 +133,12 @@ func handleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 			}
 		case prompt.UserRole:
 			rebuiltHistory = append(rebuiltHistory, p)
-			//case prompt.AssistantRole:
-			//	fmt.Printf("!!!!!!!!!!! assistatn role!\n")
+			//case prompt.AssistantRole: // <-- assistant should only come from toolman response, not added here!
 			//	rebuiltHistory = append(rebuiltHistory, p)
 		}
 	}
-	//
-	//fmt.Printf("\n========== bellman conversation...\n")
-	//for i, m := range rebuiltHistory {
-	//	fmt.Printf("msg %v: %v\n", i, m)
-	//}
 
-	model, err := gen.ToModel(req.Model) // TODO use model!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+	model, err := gen.ToModel(req.Model)
 	if err != nil {
 		log.Fatalf("error: %e", err)
 	}
@@ -160,7 +157,7 @@ func handleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. EXTRACT TOKENS & UPDATE GLOBAL COUNTERS
+	// EXTRACT TOKENS & UPDATE GLOBAL COUNTERS
 	inputTokens := res.Metadata.InputTokens
 	outputTokens := res.Metadata.OutputTokens
 
@@ -173,13 +170,8 @@ func handleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 		inputTokens, outputTokens,
 		atomic.LoadUint64(&GlobalInputTokens), atomic.LoadUint64(&GlobalOutputTokens))
 
-	// extract individual tool calls with self-correction
-	//maxRetries := 10
-	//for _ = range maxRetries {
-	//fmt.Printf("Prompt tool result: %+v\n", res.Tools)
+	// extract individual tool calls for bfcl
 	extractedCalls, err := bfcl.GetToolCalls(res, bfclTools)
-	//fmt.Printf("Extracted tool calls: %v\n", extractedCalls)
-	//}
 
 	// add bellman response to history, EITHER: tool or text
 	var toolCallIDs []string
@@ -192,20 +184,13 @@ func handleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Fatalf("error: %e", err)
 		}
-		//fmt.Printf("!!!!!!!!!!! assistant answer: %s\n", content)
 		rebuiltHistory = append(rebuiltHistory, prompt.AsAssistant(content))
 	} else if res.IsTools() {
 		for _, t := range res.Tools {
-			//fmt.Printf(" ===== Tool in response: %+v\n\n", t)
 			rebuiltHistory = append(rebuiltHistory, prompt.AsToolCall(t.ID, t.Name, t.Argument))
 			toolCallIDs = append(toolCallIDs, t.ID)
 		}
 	}
-
-	//fmt.Printf("\n########## toolman conversation history...\n")
-	//for i, m := range rebuiltHistory {
-	//	fmt.Printf("msg %v: %+v\n", i, m)
-	//}
 
 	resp := BenchmarkResponse{
 		ToolCalls:      extractedCalls,
