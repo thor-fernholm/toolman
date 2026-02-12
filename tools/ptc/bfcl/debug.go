@@ -47,7 +47,7 @@ type LogEntry struct {
 	RequestJSON    interface{} `json:"request_json"`
 	ResponseJSON   interface{} `json:"response_json"`
 	UserQuery      string      `json:"user_query"`
-	LLMRawContent  string      `json:"llm_raw_content"`
+	LLMRawContent  []string    `json:"llm_raw_content"`
 	ExtractedTools interface{} `json:"extracted_tools"`
 	InputTokens    int         `json:"input_tokens"`
 	OutputTokens   int         `json:"output_tokens"`
@@ -178,100 +178,14 @@ func MiddlewareDebugLogger(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-//
-//func MiddlewareDebugLogger(next http.HandlerFunc) http.HandlerFunc {
-//	return func(w http.ResponseWriter, r *http.Request) {
-//		start := time.Now()
-//
-//		// 1. Capture Request
-//		bodyBytes, _ := io.ReadAll(r.Body)
-//		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-//
-//		// 2. Wrap Response Writer
-//		rw := &responseWriterInterceptor{ResponseWriter: w, statusCode: 200}
-//
-//		// 3. CALL NEXT
-//		next(rw, r)
-//
-//		// 4. Async Log
-//		go func() {
-//			// Define struct subsets to avoid circular dependencies with main
-//			// or just use generic maps for robustness
-//			var reqMap map[string]interface{}
-//			_ = json.Unmarshal(bodyBytes, &reqMap)
-//
-//			var respMap map[string]interface{}
-//			_ = json.Unmarshal(rw.body.Bytes(), &respMap)
-//
-//			// 2. Unmarshal Response STRONGLY TYPED for History
-//			// We define a partial struct to pull out the exact prompt.Prompt objects
-//			type PartialResponse struct {
-//				ToolCalls    interface{}     `json:"tool_calls"`
-//				History      []prompt.Prompt `json:"toolman_history"` // <--- KEY FIX
-//				InputTokens  int             `json:"input_tokens"`
-//				OutputTokens int             `json:"output_tokens"`
-//			}
-//			var respStruct PartialResponse
-//			_ = json.Unmarshal(rw.body.Bytes(), &respStruct)
-//
-//			// Extract Metrics safely from generic maps
-//			inTok := 0
-//			outTok := 0
-//			if v, ok := respMap["input_tokens"].(float64); ok {
-//				inTok = int(v)
-//			}
-//			if v, ok := respMap["output_tokens"].(float64); ok {
-//				outTok = int(v)
-//			}
-//
-//			// Update Globals
-//			atomic.AddUint64(&Store.GlobalInputTokens, uint64(inTok))
-//			atomic.AddUint64(&Store.GlobalOutputTokens, uint64(outTok))
-//
-//			Store.Lock()
-//			defer Store.Unlock()
-//
-//			// Session Logic: Heuristic to detect new test case
-//			// If the request has very few messages (e.g. 1 user msg), it's likely a start
-//			msgs, _ := reqMap["messages"].([]interface{})
-//			hist := respStruct.History // Use real structs
-//
-//			if Store.CurrentSess == nil || (len(hist) == 0 && len(msgs) <= 1) {
-//				newSess := &Session{
-//					ID:        fmt.Sprintf("Test Case #%d", len(Store.Sessions)+1),
-//					StartTime: time.Now().Format("15:04:05"),
-//					Requests:  make([]*LogEntry, 0),
-//				}
-//				// Prepend new session to top of list
-//				Store.Sessions = append(Store.Sessions, newSess)
-//				Store.CurrentSess = newSess
-//			}
-//
-//			// Extract Raw LLM Content (Need to dig into history)
-//			rawContent := getRawLLMContentFromHistory(hist)
-//
-//			entry := &LogEntry{
-//				ID:             len(Store.CurrentSess.Requests) + 1,
-//				Timestamp:      time.Now().Format("15:04:05.000"),
-//				RequestJSON:    reqMap,
-//				ResponseJSON:   respMap,
-//				UserQuery:      extractUserQuery(msgs),
-//				LLMRawContent:  rawContent,
-//				ExtractedTools: respMap["tool_calls"],
-//				InputTokens:    inTok,
-//				OutputTokens:   outTok,
-//				Duration:       time.Since(start).String(),
-//			}
-//			Store.CurrentSess.Requests = append(Store.CurrentSess.Requests, entry)
-//		}()
-//	}
-//}
-
 // THIS IS THE ORIGINAL WORKING LOGIC
-func extractLLMContent(hist []prompt.Prompt) string {
+func extractLLMContent(hist []prompt.Prompt) []string {
 	if len(hist) == 0 {
-		return ""
+		fmt.Printf("[debug] no hist")
+		return []string{""}
 	}
+
+	var response []string
 
 	// Scan backwards
 	for i := len(hist) - 1; i >= 0; i-- {
@@ -279,13 +193,16 @@ func extractLLMContent(hist []prompt.Prompt) string {
 
 		// 1. Assistant Role (Text / Thoughts / PTC Code)
 		if p.Role == prompt.AssistantRole {
-			return p.Text
+			text := fmt.Sprintf("Assistant: %s\n", p.Text)
+			response = append(response, text)
+			break
 		}
 
 		// 2. Tool Call Role (Native Tool Calls)
 		if p.Role == prompt.ToolCallRole && p.ToolCall != nil {
 			// p.ToolCall.Arguments is []byte, cast to string
-			return fmt.Sprintf("Tool Call: %s\nArguments: %s", p.ToolCall.Name, string(p.ToolCall.Arguments))
+			text := fmt.Sprintf("Tool Call: %s\nArguments: %s", p.ToolCall.Name, string(p.ToolCall.Arguments))
+			response = append(response, text)
 		}
 
 		// 3. Stop if we hit previous turn
@@ -294,7 +211,12 @@ func extractLLMContent(hist []prompt.Prompt) string {
 		}
 	}
 
-	return "No LLM output found"
+	if len(response) == 0 {
+		fmt.Printf("[debug] no llm output found")
+		return []string{"No LLM output found"}
+	}
+	fmt.Printf("[debug] response: %s\n", response)
+	return response
 }
 
 func extractUserQuery(msgs []interface{}) string {

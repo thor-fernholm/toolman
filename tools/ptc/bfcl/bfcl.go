@@ -3,12 +3,16 @@ package bfcl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/dop251/goja"
 	"github.com/modfin/bellman/models/gen"
+	"github.com/modfin/bellman/prompt"
 	"github.com/modfin/bellman/schema"
 	"github.com/modfin/bellman/tools"
 )
@@ -134,14 +138,23 @@ func createEchoFunction(name string) func(context.Context, tools.Call) (string, 
 }
 
 // GetToolCalls extracts calls in the Ground Truth format: [{"func": {"arg": val}}]
-func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCall, error) {
+func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCall, []prompt.Prompt, []string, error) {
+	// BFCL
 	var calls []ExtractedCall
+	// Toolman
+	var toolCalls []prompt.Prompt
+	var toolIDs []string
 
-	if !res.IsTools() {
-		return calls, nil
+	if !res.IsTools() { // --> res.IsText()
+		text, err := res.AsText()
+		if err != nil {
+			log.Fatalf("error: %e", err)
+		}
+		assistant := []prompt.Prompt{prompt.AsAssistant(text)}
+		return calls, assistant, toolIDs, nil
 	}
 
-	for _, tool := range res.Tools {
+	for i, tool := range res.Tools {
 		// --- PTC / Code Execution ---
 		if tool.Name == "code_execution" {
 			var codeArgs struct {
@@ -153,6 +166,18 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCa
 				execResult := ExecuteAndExtract(codeArgs.Code, availableTools)
 				// Append all calls found in the JS code
 				calls = append(calls, execResult.Calls...)
+
+				// add toolman call + ID & check for JS execution errors! TODO verify!
+				fmt.Printf("Tool call %v: name: %v, args: %v\n", i, tool.Name, tool.Argument)
+				toolCalls = append(toolCalls, prompt.AsToolCall(tool.ID, tool.Name, tool.Argument))
+				toolIDs = append(toolIDs, tool.ID)
+				if execResult.Error != nil {
+					fmt.Printf("Tool error response %v: name: %v, error: %v\n", i, tool.Name, execResult.Error.Error())
+					toolCalls = append(toolCalls, prompt.AsToolResponse(tool.ID, tool.Name, execResult.Error.Error())) // will not be added to bfcl tool calls!
+					//toolIDs = append(toolIDs, tool.ID) // <-- don't think this is needed... only for returned bfcl tools
+				}
+			} else {
+				fmt.Printf("Warning: error unmarshalling code_execution argument: %e\n", err)
 			}
 			continue
 		}
@@ -161,11 +186,15 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCa
 		// Map it to the same structure: {"func_name": {"arg": val}}
 		var argsMap map[string]interface{}
 
-		// Try unmarshaling argument. If it fails (rare), we skip args or make empty map
+		// Try unmarshalling argument. If it fails (rare), we skip args or make empty map
 		if err := json.Unmarshal(tool.Argument, &argsMap); err != nil {
 			fmt.Printf("Warning: Failed to unmarshal args for %s: %v\n", tool.Name, err)
 			argsMap = make(map[string]interface{})
 		}
+
+		fmt.Printf("Tool call %v: name: %v, args: %v\n", i, tool.Name, tool.Argument)
+		toolCalls = append(toolCalls, prompt.AsToolCall(tool.ID, tool.Name, tool.Argument))
+		toolIDs = append(toolIDs, tool.ID)
 
 		// Construct the entry
 		entry := ExtractedCall{
@@ -174,7 +203,7 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCa
 		calls = append(calls, entry)
 	}
 
-	return calls, nil
+	return calls, toolCalls, toolIDs, nil
 }
 
 // ExtractedCall: The structure of a single tool call found during execution
@@ -183,7 +212,7 @@ type ExtractedCall map[string]map[string]interface{}
 // ExecutionResult holds both the calls found and the final return value of the script
 type ExecutionResult struct {
 	Calls []ExtractedCall `json:"tool_calls"`
-	//FinalReturn interface{}     `json:"final_return"`
+	Error error           `json:"error"`
 }
 
 func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionResult {

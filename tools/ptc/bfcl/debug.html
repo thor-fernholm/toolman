@@ -22,10 +22,22 @@
         pre code.hljs { background: #0f172a; padding: 1.25em; border-radius: 0.5em; font-size: 0.9em; line-height: 1.5; }
 
         .code-scroll-container {
-            max-height: 600px;
+            /* 1. Enable Horizontal Scroll */
+            white-space: pre;
             overflow: auto;
+
+            /* 2. Fill Screen / Empty Area */
+            /*min-height: 500px;  !* Forces it to take up space *!*/
+            max-height: 85vh;   /* Allows it to grow nearly full height */
+
+            /* Existing styles */
             border-radius: 0.5rem;
             border: 1px solid #334155;
+
+            /*max-height: 600px;*/
+            /*overflow: auto;*/
+            /*border-radius: 0.5rem;*/
+            /*border: 1px solid #334155;*/
         }
 
         /* Session List Styling */
@@ -221,7 +233,12 @@
                         <div class="space-y-4">
                             <div>
                                 <div class="label mb-2 text-xs font-bold text-slate-500 uppercase tracking-wider flex justify-between"><span>Raw Model Output</span></div>
-                                <div class="code-scroll-container" style="max-height: 400px;"><pre><code class="language-javascript">${escapeHtml(req.llm_raw_content)}</code></pre></div>
+                                <div class="code-scroll-container"><pre><code class="language-javascript">${
+                                    // Ensure it is treated as an array, even if null or single string
+                                    (Array.isArray(req.llm_raw_content) ? req.llm_raw_content : [req.llm_raw_content || ""])
+                                        .map(c => escapeHtml(c))
+                                        .join('\n\n// --- NEXT OUTPUT ---\n\n')
+                                }</code></pre></div>
                             </div>
                             ${hasTools ? `<div><div class="label mb-2 text-xs font-bold text-green-400 uppercase tracking-wider flex items-center gap-2"><span>🛠️ Extracted Tool Calls</span></div><div class="code-scroll-container border-green-500/30 bg-green-900/5"><pre><code class="language-json text-sm">${JSON.stringify(req.extracted_tools, null, 2)}</code></pre></div></div>` : ''}
                         </div>

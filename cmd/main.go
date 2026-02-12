@@ -144,8 +144,22 @@ func handleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 	}
 	//model = openai.GenModel_gpt4_1_mini_250414
 
+	// fix BFCL poor tool returns: TODO remove or keep?
+	bfclPrompt := `# Tool Return Conventions (CRITICAL)
+Tool functions in this environment follow these conventions:
+
+- Successful operations may return 'undefined' or 'null'
+- Failed operations return a string describing the error
+- Tools do NOT return structured success objects unless explicitly stated
+- Absence of a return value should be interpreted as success, not failure
+
+You MUST inspect tool return values before assuming success.
+Do NOT assume that a tool returning 'undefined' means “no-op”.
+`
+	systemPrompt := fmt.Sprintf("%s\n\n%s", req.SystemPrompt, bfclPrompt)
+
 	llm := client.Generator().Model(model).
-		System(req.SystemPrompt). // Use passed system prompt or default
+		System(systemPrompt).
 		SetTools(bfclTools...).
 		SetPTCLanguage(tools.JavaScript).
 		Temperature(req.Temperature)
@@ -170,33 +184,17 @@ func handleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 		inputTokens, outputTokens,
 		atomic.LoadUint64(&GlobalInputTokens), atomic.LoadUint64(&GlobalOutputTokens))
 
-	// extract individual tool calls for bfcl
-	extractedCalls, err := bfcl.GetToolCalls(res, bfclTools)
+	// extract individual new tool calls for bfcl + toolman
+	extractedCalls, toolmanCalls, toolCallIDs, err := bfcl.GetToolCalls(res, bfclTools)
 
-	// add bellman response to history, EITHER: tool or text
-	var toolCallIDs []string
-	if err != nil {
-		fmt.Printf("!!!!!!!!!!! error occurred: %e", err)
-		panic(err)
-		//rebuiltHistory = append(rebuiltHistory, prompt.AsAssistant(err.Error()))
-	} else if res.IsText() {
-		content, err := res.AsText()
-		if err != nil {
-			log.Fatalf("error: %e", err)
-		}
-		rebuiltHistory = append(rebuiltHistory, prompt.AsAssistant(content))
-	} else if res.IsTools() {
-		for _, t := range res.Tools {
-			rebuiltHistory = append(rebuiltHistory, prompt.AsToolCall(t.ID, t.Name, t.Argument))
-			toolCallIDs = append(toolCallIDs, t.ID)
-		}
-	}
+	// add new toolman calls to conversation history
+	toolmanHistory = append(rebuiltHistory, toolmanCalls...)
 
 	resp := BenchmarkResponse{
 		ToolCalls:      extractedCalls,
 		ToolCallIDs:    toolCallIDs,
-		ToolmanHistory: rebuiltHistory,
-		Content:        "Tool calls generated", // <-- is this used?
+		ToolmanHistory: toolmanHistory,
+		Content:        "Tool calls generated", // TODO <-- is this used in bfcl?
 		InputTokens:    res.Metadata.InputTokens,
 		OutputTokens:   res.Metadata.OutputTokens,
 	}
