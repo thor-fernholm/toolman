@@ -188,6 +188,7 @@ func extractLLMContent(hist []prompt.Prompt) []string {
 	var response []string
 
 	// Scan backwards
+	hitToolCall := false
 	for i := len(hist) - 1; i >= 0; i-- {
 		p := hist[i]
 
@@ -203,19 +204,25 @@ func extractLLMContent(hist []prompt.Prompt) []string {
 			// p.ToolCall.Arguments is []byte, cast to string
 			text := fmt.Sprintf("Tool Call: %s\nArguments: %s", p.ToolCall.Name, string(p.ToolCall.Arguments))
 			response = append(response, text)
+			hitToolCall = true
 		}
 
 		// 3. Stop if we hit previous turn
-		if p.Role == prompt.UserRole || p.Role == prompt.ToolResponseRole {
+		if p.Role == prompt.UserRole {
+			break
+		}
+
+		// stop on first BFCL response (before last tool call) <-- keep LLM output on JS errors...
+		if p.Role == prompt.ToolResponseRole && hitToolCall {
 			break
 		}
 	}
 
 	if len(response) == 0 {
-		fmt.Printf("[debug] no llm output found")
+		//fmt.Printf("[debug] no llm output found")
 		return []string{"No LLM output found"}
 	}
-	fmt.Printf("[debug] response: %s\n", response)
+	//fmt.Printf("[debug] response: %s\n", response)
 	return response
 }
 

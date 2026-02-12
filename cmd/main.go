@@ -1,13 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync/atomic"
 
 	"github.com/joho/godotenv"
@@ -120,17 +119,25 @@ func handleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 
 	// Add tool response after call!
 	var rebuiltHistory []prompt.Prompt
-	for _, p := range toolmanHistory {
+	for i, p := range toolmanHistory {
 		switch p.Role {
 		case prompt.ToolCallRole:
 			rebuiltHistory = append(rebuiltHistory, p)
-			// find (last) corresponding tool result
-			for j := len(req.Messages) - 1; j >= 0; j-- {
+			// find all corresponding tool results and concatenate
+			var concatenatedReturns []string
+			for j := 0; j < len(req.Messages); j++ {
 				if req.Messages[j].Role == "tool_response" && req.Messages[j].ToolID == p.ToolCall.ToolCallID {
-					rebuiltHistory = append(rebuiltHistory, prompt.AsToolResponse(p.ToolCall.ToolCallID, p.ToolCall.Name, req.Messages[j].Content))
-					break
+					concatenatedReturns = append(concatenatedReturns, fmt.Sprintf("Function '%s' result: %s.", req.Messages[j].ToolName, req.Messages[j].Content))
 				}
 			}
+			// add JS runtime errors to tool response
+			if len(toolmanHistory) > i+1 {
+				nextPrompt := toolmanHistory[i+1]
+				if nextPrompt.Role == prompt.ToolResponseRole && nextPrompt.ToolResponse.ToolCallID == p.ToolCall.ToolCallID {
+					concatenatedReturns = append(concatenatedReturns, nextPrompt.ToolResponse.Response)
+				}
+			}
+			rebuiltHistory = append(rebuiltHistory, prompt.AsToolResponse(p.ToolCall.ToolCallID, p.ToolCall.Name, strings.Join(concatenatedReturns, "\n")))
 		case prompt.UserRole:
 			rebuiltHistory = append(rebuiltHistory, p)
 			//case prompt.AssistantRole: // <-- assistant should only come from toolman response, not added here!
@@ -144,22 +151,13 @@ func handleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 	}
 	//model = openai.GenModel_gpt4_1_mini_250414
 
-	// fix BFCL poor tool returns: TODO remove or keep?
-	bfclPrompt := `# Tool Return Conventions (CRITICAL)
-Tool functions in this environment follow these conventions:
-
-- Successful operations may return 'undefined' or 'null'
-- Failed operations return a string describing the error
-- Tools do NOT return structured success objects unless explicitly stated
-- Absence of a return value should be interpreted as success, not failure
-
-You MUST inspect tool return values before assuming success.
-Do NOT assume that a tool returning 'undefined' means “no-op”.
-`
-	systemPrompt := fmt.Sprintf("%s\n\n%s", req.SystemPrompt, bfclPrompt)
+	// remove bfcl prompt for PTC - misleading!
+	if req.EnablePTC {
+		req.SystemPrompt = ""
+	}
 
 	llm := client.Generator().Model(model).
-		System(systemPrompt).
+		System(req.SystemPrompt).
 		SetTools(bfclTools...).
 		SetPTCLanguage(tools.JavaScript).
 		Temperature(req.Temperature)
@@ -201,15 +199,4 @@ Do NOT assume that a tool returning 'undefined' means “no-op”.
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
-}
-
-func PrintRequest(r *http.Request) {
-	bodyBytes, _ := io.ReadAll(r.Body)
-	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	var prettyJSON bytes.Buffer
-	if err := json.Indent(&prettyJSON, bodyBytes, "", "  "); err != nil {
-		fmt.Printf("Received Raw Body: %s\n", string(bodyBytes))
-	} else {
-		fmt.Printf("Received Pretty JSON:\n%s\n", prettyJSON.String())
-	}
 }

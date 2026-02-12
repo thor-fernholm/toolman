@@ -167,12 +167,15 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCa
 				// Append all calls found in the JS code
 				calls = append(calls, execResult.Calls...)
 
-				// add toolman call + ID & check for JS execution errors! TODO verify!
-				fmt.Printf("Tool call %v: name: %v, args: %v\n", i, tool.Name, tool.Argument)
+				// add ID for each bfcl tool call
+				for range execResult.Calls {
+					toolIDs = append(toolIDs, tool.ID)
+				}
+
+				// add toolman call + ID & check for JS execution errors!
 				toolCalls = append(toolCalls, prompt.AsToolCall(tool.ID, tool.Name, tool.Argument))
-				toolIDs = append(toolIDs, tool.ID)
+				//toolIDs = append(toolIDs, tool.ID)
 				if execResult.Error != nil {
-					fmt.Printf("Tool error response %v: name: %v, error: %v\n", i, tool.Name, execResult.Error.Error())
 					toolCalls = append(toolCalls, prompt.AsToolResponse(tool.ID, tool.Name, execResult.Error.Error())) // will not be added to bfcl tool calls!
 					//toolIDs = append(toolIDs, tool.ID) // <-- don't think this is needed... only for returned bfcl tools
 				}
@@ -233,7 +236,7 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionRes
 	})
 	defer timer.Stop()
 
-	// POLYFILLS: Prevent ReferenceErrors for common globals TODO remove?
+	// POLYFILLS: Prevent ReferenceErrors for common globals
 	// LLMs often treat 'console' and 'print' as standard.
 	dummyFunc := func(call goja.FunctionCall) goja.Value { return vm.ToValue(nil) }
 	vm.Set("print", dummyFunc)
@@ -278,8 +281,13 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionRes
 				tName: argsMap,
 			})
 
-			// Return mock to keep script running
-			return vm.ToValue("mock_return")
+			// Return generic mock to keep script running
+			mock := vm.NewObject()
+			mock.Set("status", "success")
+			mock.Set("success", true)
+			mock.Set("error", nil)
+
+			return mock
 		}
 		vm.Set(tName, interceptor)
 	}
@@ -294,11 +302,12 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionRes
 		if !errors.As(err, &evalErr) {
 			// If it's a real runtime error, just log it.
 			// We DO NOT return the error to the caller, because we want the partial results.
-			fmt.Printf("JS Runtime Warning: %v\n", err)
+			fmt.Printf("[warning] JS Runtime Error: %v\n", err)
 		}
 	}
 
 	return &ExecutionResult{
 		Calls: capturedCalls,
+		Error: fmt.Errorf("javascript runtime error: %s", err),
 	}
 }

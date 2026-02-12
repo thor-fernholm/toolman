@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Toolman Debugger</title>
+    <title>Toolman BFCL Debugger</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/javascript.min.js"></script>
@@ -61,7 +61,7 @@
     <div class="flex items-center gap-3">
         <div class="bg-blue-600 p-2 rounded-lg text-white">🚀</div>
         <div>
-            <h1 class="text-xl font-bold tracking-wide text-white">Toolman <span class="text-blue-400">Debugger</span></h1>
+            <h1 class="text-xl font-bold tracking-wide text-white">Toolman <span class="text-blue-400">BFCL Debugger</span></h1>
             <div id="connection-status" class="text-xs text-green-500 font-mono">● Connected</div>
         </div>
     </div>
@@ -226,7 +226,15 @@
                             </div>
                             <details class="group">
                                 <summary class="label cursor-pointer text-slate-500 hover:text-blue-400 transition flex items-center gap-2 text-xs font-bold uppercase mt-4 select-none">▶ Full Request Payload</summary>
-                                <div class="mt-2"><div class="code-scroll-container"><pre><code class="language-json text-xs">${JSON.stringify(req.request_json, null, 2)}</code></pre></div></div>
+                                <div class="mt-2"><div class="code-scroll-container"><pre><code class="language-json text-xs">${JSON.stringify(req.request_json || [], null, 2)}</code></pre></div></div>
+                            </details>
+                            <details class="group">
+                                <summary class="label cursor-pointer text-slate-500 hover:text-blue-400 transition flex items-center gap-2 text-xs font-bold uppercase mt-4 select-none">▶ Toolman History (response)</summary>
+                                <div class="mt-2"><div class="code-scroll-container"><pre><code class="language-json text-xs">${JSON.stringify(req.response_json?.toolman_history || [], null, 2)}</code></pre></div></div>
+                            </details>
+                            <details class="group">
+                                <summary class="label cursor-pointer text-slate-500 hover:text-blue-400 transition flex items-center gap-2 text-xs font-bold uppercase mt-4 select-none">▶ Full Response Payload</summary>
+                                <div class="mt-2"><div class="code-scroll-container"><pre><code class="language-json text-xs">${JSON.stringify(req.response_json || [], null, 2)}</code></pre></div></div>
                             </details>
                         </div>
 

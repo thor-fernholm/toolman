@@ -63,17 +63,19 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 	}
 
 	// tool documentation fragment
-	docsFragment := strings.Join(descriptions, "\n")
+	docsFragment := strings.Join(descriptions, "\n\n")
 
 	// create the final PTC tool
 	ptcTool := tools.NewTool("code_execution",
 		tools.WithDescription(
-			"MANDATORY: Execute JavaScript code in a Goja runtime.\n"+
-				"Input must be a valid, self-contained JavaScript program wrapped in a single IIFE.\n"+
-				"You MUST combine all tool calls and logic into ONE script and call this tool exactly once per turn.\n"+
-				"The script MUST return a single value.\n"+
-				"Return value must be a valid JSON value (object, array, string, number, boolean, or null).\n"+
-				"In the JavaScript environment, the following tool functions are available:\n"+
+			"Execute a complete JavaScript program in a minimal Goja runtime.\n"+
+				"The input MUST be a self-contained script wrapped exactly as:\n"+
+				"(function() { ... })()\n\n"+
+				"All task logic and ALL tool calls must be inside this single script.\n"+
+				"Call this tool exactly once per turn.\n\n"+
+				"The script must return one final JSON value.\n"+
+				"No logging, async code, or external APIs are available.\n\n"+
+				"The following tool functions are callable inside the script:\n"+
 				docsFragment,
 		),
 		tools.WithArgSchema(CodeArgs{}),
@@ -82,16 +84,7 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 
 	// create PTC system prompt fragment with tools
 	systemFragment := "\n\n" + getSystemFragmentJS() +
-		"\n## Return Type Definition\n" +
-		"json means any valid JSON value:\n" +
-		"- object\n" +
-		"- array\n" +
-		"- string\n" +
-		"- number\n" +
-		"- boolean\n" +
-		"- null\n\n" +
-		"## Available JavaScript Tool Functions (Callable ONLY inside 'code_execution')\n" +
-		"Tool signatures below are exact and binding. Do not assume additional parameters, defaults, overloads, or return fields.\n\n" +
+		"\n## Available JavaScript Tool Functions\n\n" +
 		docsFragment
 
 	return ptcTool, systemFragment, nil
@@ -172,23 +165,15 @@ func formatToolSignature(t tools.Tool) string {
 		argBlock = "{}"
 	}
 
-	exampleArgs := buildExampleArgs(args)
+	//exampleArgs := buildExampleArgs(args)
 
 	return fmt.Sprintf(
 		`function %s(args: %s): %s
-
-Description:
-- %s
-
-Example:
-%s(%s)
-`,
+- %s`,
 		t.Name,
 		argBlock,
 		inferReturnType(t),
 		t.Description,
-		t.Name,
-		exampleArgs,
 	)
 }
 
@@ -216,36 +201,6 @@ func extractArgs(s *schema.JSON) []ArgField {
 	})
 
 	return args
-}
-
-func buildExampleArgs(args []ArgField) string {
-	if len(args) == 0 {
-		return "{}"
-	}
-
-	var parts []string
-	for _, a := range args {
-		parts = append(parts, fmt.Sprintf("%s: %s", a.Name, exampleValueForType(a.Type)))
-	}
-
-	return "{ " + strings.Join(parts, ", ") + " }"
-}
-
-func exampleValueForType(t string) string {
-	switch t {
-	case "string":
-		return `"example"`
-	case "number":
-		return "1"
-	case "boolean":
-		return "true"
-	case "any[]":
-		return "[]"
-	case "object":
-		return "{}"
-	default:
-		return "null"
-	}
 }
 
 func inferReturnType(t tools.Tool) string {
@@ -301,103 +256,55 @@ func guardRailJS(code string) (string, error) { // TODO: add more/update guardra
 	return code, nil
 }
 
-// getSystemFragmentJS returns system prompt fragment for JS PTC tool "code_execution"
 func getSystemFragmentJS() string {
-	return `# JavaScript Tool Execution Environment (Goja)
+	return `# Tool Return Conventions
+- Success may return undefined or null.
+- Failure returns a string error.
+- Absence of a return value means success.
+- Always inspect tool return values.
 
-Important:
-You must solve the entire user task by writing ONE complete JavaScript program.
-All required tool calls, logic, branching, and data processing MUST occur
-inside a single JavaScript script executed via code_execution.
+# JavaScript Execution Environment (Goja)
 
-You are running inside a minimal, embedded JavaScript runtime (Goja).
-This environment is NOT Node.js, NOT a browser, and NOT standard JavaScript.
+You are generating a single executable program, not a sequence of tool calls.
 
-'code_execution' is a meta-tool used to execute JavaScript.
-It is NOT a regular tool function and MUST NOT be emulated or replaced.
+This environment executes exactly ONE JavaScript program per turn.
+You must invoke 'code_execution' at most once.
+Inside that program, you may call multiple tool functions as needed.
 
-Plan all required tool calls first, then write one script that executes them in order.
+Execution is part of solving the task.
+You may use execution results to compute the final answer.
 
-## Environment Constraints (CRITICAL)
-The following APIs and capabilities DO NOT exist:
-- require
-- import
-- fs, path, os, process, Buffer
-- DOM, window, or browser APIs
-- console or logging
-- async functions, promises, or callbacks
-- global utilities unless explicitly listed
+You run in a minimal embedded JavaScript runtime.
+Not Node.js. Not a browser. No async. No console.
 
-If a function or object is not explicitly listed in the tool section, it does not exist.
-Calling an undefined function will cause execution failure.
+Only basic JavaScript syntax is available.
+All I/O and side effects must use provided tool functions.
+Tool functions are global. Do NOT prefix them with "functions." or any namespace.
 
-## Available Capabilities
-You may ONLY:
-- Use basic JavaScript syntax (variables, conditionals, loops, arrays, objects)
-- Call explicitly listed tool functions
-- Return data using return only
+## When To Use code_execution
 
-All I/O, filesystem access, networking, and side effects MUST be performed
-through provided tool functions.
+Use 'code_execution' ONLY if the task requires tool functions
+(file operations, network, data retrieval, etc).
 
-## Mandatory Execution Rules (READ CAREFULLY)
-1. ONE SCRIPT
-You must write exactly ONE JavaScript program that performs ALL steps of the task.
-Do NOT split logic across multiple scripts or turns.
+If no tool is required, respond in natural language.
+Never output JavaScript unless invoking 'code_execution'.
 
-2. ONE code_execution CALL
-You must call code_execution exactly once per turn.
-All tool calls must be embedded inside that single JavaScript program.
+## If Using code_execution
 
-3. SINGLE IIFE
-The entire program MUST be wrapped in exactly one Immediately Invoked Function Expression:
-(function() { ... })()
+Before invoking 'code_execution', determine ALL required tool calls and combine them into ONE complete script.
 
-4. SYNCHRONOUS ONLY
-All tool calls are blocking and synchronous.
+- Invoke 'code_execution' exactly once per turn.
+- Provide one complete script wrapped exactly as:
+  (function() { ... })()
+- All logic and tool calls must be inside that script.
+- Assign tool results to variables before using them.
+- Execution is strictly synchronous. Do NOT use async or await.
+- You MUST return one final JSON value from the IIFE.
+- No logging or external APIs.
 
-5. RETURN-ONLY OUTPUT
-Do not log, print, or emit intermediate output.
-The single return value is the final result.
+If you invoke 'code_execution', your entire response must be
+a structured tool call with no text before or after.
 
-Explicitly Forbidden Behavior
-
-- Calling code_execution more than once
-- Performing part of the task outside JavaScript
-- Calling tools outside the IIFE
-- Asking for additional turns to finish the task
-- Simulating tool results instead of calling tools
-
-## Tool Usage Rules (IMPORTANT)
-- File operations must use file-related tools
-- Network operations must use network tools
-- Data retrieval must use provided fetch tools
-- Always assign tool call results to a variable before using them.
-
-Never invent, assume, or simulate APIs.
-
-If no appropriate tool exists for a required operation, return an object
-explaining the limitation instead of attempting unsupported JavaScript.
-
-## Output Contract (CRITICAL)
-
-Your final JavaScript program response MUST be a call to the tool 'code_execution''.
-
-- You MUST NOT output JavaScript code directly as assistant text.
-- The JavaScript program MUST be provided as the value of the 'code' argument
-  to the 'code_execution' tool.
-- The assistant response must consist of exactly ONE tool call:
-  code_execution({ code: "<full JavaScript program>" })
-
-Any response that outputs JavaScript outside of a 'code_execution' tool call
-is invalid.
-
-## Correct Example (ALL LOGIC IN ONE SCRIPT)
-(function() {
-  var file = read_file({ path: "final_report.pdf" });
-  var status = get_status({ data: file });
-  write_file({ path: "temp/final_report.pdf", data: file });
-  return { status: status };
-})()
+Never write code_execution({ ... }) as plain text.
 `
 }
