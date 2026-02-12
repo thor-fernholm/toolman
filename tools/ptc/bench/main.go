@@ -55,8 +55,6 @@ func main() {
 		panic(err)
 	}
 
-	//http.HandleFunc("/bfcl", handleGenerateBFCL)
-
 	// Register API Endpoint
 	http.HandleFunc("/bfcl", bfcl.MiddlewareDebugLogger(handleGenerateBFCL))
 
@@ -66,8 +64,8 @@ func main() {
 	http.HandleFunc("/debug/api/clear", bfcl.HandleDebugClear)
 
 	fmt.Println("---------------------------------------------------------")
-	fmt.Println(" Toolman Server Running")
-	fmt.Println(" API Endpoint:   http://localhost:8080/bfcl")
+	fmt.Println(" Toolman Bench Server Running")
+	fmt.Println(" BFCL API Endpoint:   http://localhost:8080/bfcl")
 	fmt.Println(" Debug UI:       http://localhost:8080/debug")
 	fmt.Println("---------------------------------------------------------")
 
