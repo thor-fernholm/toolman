@@ -1,3 +1,9 @@
+# Toolman
+
+Toolman is an extension of Bellman that integrates Programmatic Tool-Calling (PTC) functionality, as well as tool-augmentation and agentic benchmarks.
+
+For Toolman related documentation, please refer to [TOOLMAN.md](tools/ptc/TOOLMAN.md).
+
 # Bellman
 
 It tries to be unified interface to interact with LLMs and embedding models.

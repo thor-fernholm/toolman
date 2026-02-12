@@ -1,0 +1,71 @@
+# Toolman
+
+Toolman introduces Programmatic Tool-Calling (PTC), allowing LLMs to write and execute code (e.g., JavaScript) to interact with tools. This enables complex logic, loops, and data manipulation that standard single-turn tool calling struggles with.
+
+### Usage
+
+To use PTC, you need to define your tools and set the PTC language on the generator.
+
+```go
+// Define your Bellman tools as usual, and set PTC property to true
+ptcTool := tools.NewTool("get_quote", ...
+    tool.WithPTC(true), // <-- Enable PTC
+	...
+)
+
+// Add tool to tool list (other tools can be both PTC and non-PTC)
+allTools = append(allTools, ptcTool)
+
+// Initialize llm and set PTC language (or default to JavaScript)
+llm := client.Generator().
+    Model(openai.GenModel_gpt4o).
+    SetTools(allTools). // <-- set tools as usual (PTC will enable inside here)
+    SetPTCLanguage(tools.JavaScript) // <-- set PTC language to javaScript 
+
+res, err := llm.Prompt(prompt.AsUser("Give me 3 quotes from different characters"))
+
+if err != nil {
+log.Fatalf("Prompt() error = %v", err)
+}
+
+// Evaluate with callback function
+err = res.Eval()
+if err != nil {
+    log.Fatalf("Eval() error = %v", err)
+}
+```
+
+For documentation on how to use Bellman, please refer to the Bellman [README.md](../../README.md).
+
+## Benchmarking
+
+Toolman includes a benchmarking suite to evaluate LLM performance on tool-calling tasks, specifically focusing on PTC capabilities.
+
+Benchmarks can run both with PTC enabled and disabled.
+
+### Berkeley Function Calling Leaderboard (BFCL)
+
+We provide an implementation to run the BFCL benchmark using Toolman's PTC engine. The benchmark is best run from the Toolman branch in the BFCL repo, see [?]().
+
+#### Running the Benchmark Server
+
+The benchmark server acts as an adapter between the BFCL evaluation scripts and the Bellman/Toolman API.
+
+1. Navigate to the benchmark directory:
+   ```bash
+   cd tools/ptc/bench
+   ```
+2. Set up your environment variables in a `.env` file:
+   ```env
+   BELLMAN_URL=http://localhost:8080
+   BELLMAN_TOKEN=your_token
+   ```
+3. Run the server:
+   ```bash
+   go run main.go
+
+The BFCL server endpoint can be accessed at: `http://localhost:8080/bfcl`.
+
+#### Debug
+
+To debug BFCL benchmark using Toolman, a simple UI is provided. When the BFCL benchmark server is started; the debug UI can be accessed at: `http://localhost:8080/debug`.
