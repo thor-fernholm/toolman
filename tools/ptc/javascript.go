@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/dop251/goja"
@@ -18,30 +19,6 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 	// instantiate goja vm
 	vm := goja.New()
 
-	// extract param keys from schema (naive implementation) TODO add type?
-	getArgKeys := func(s *schema.JSON) string {
-		if s == nil || len(s.Properties) == 0 {
-			return "{}"
-		}
-		// collect keys
-		var keys []string
-		for k := range s.Properties {
-			keys = append(keys, k)
-		}
-		// build "key: type"
-		var parts []string
-		for _, k := range keys {
-			prop := s.Properties[k]
-			typeName := "any"
-			if prop.Type != "" {
-				typeName = fmt.Sprintf("%v", prop.Type)
-			}
-			parts = append(parts, fmt.Sprintf("%s: %s", k, typeName))
-		}
-		// Returns format: { question: string } or { amount: number, from: string, to: string }
-		return fmt.Sprintf("{ %s }", strings.Join(parts, ", "))
-	}
-
 	// register each tool in the VM and build docs
 	for _, t := range inputTools {
 		err := bindToolToJSVM(vm, t)
@@ -49,9 +26,8 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 			return tools.Tool{}, "", fmt.Errorf("error occurred: %w", err)
 		}
 		// create signature description like: function_name({ argument: type }): description...
-		argSig := getArgKeys(t.ArgumentSchema)
-		desc := fmt.Sprintf("- %s(%s): %s", t.Name, argSig, t.Description)
-		descriptions = append(descriptions, desc)
+		signature := formatToolSignature(t)
+		descriptions = append(descriptions, signature)
 	}
 
 	// define the schema for the PTC tool itself
@@ -87,23 +63,30 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 	}
 
 	// tool documentation fragment
-	docsFragment := strings.Join(descriptions, "\n")
+	docsFragment := strings.Join(descriptions, "\n\n")
 
 	// create the final PTC tool
 	ptcTool := tools.NewTool("code_execution",
 		tools.WithDescription(
-			"MANDATORY: Execute JavaScript code. Input must be a valid, self-contained JS string.\n"+
-				"Important: JS code is a pure function (deterministic). "+
-				"Combine all logic into ONE script. "+
-				"Returns a JSON object with results.\n"+
-				"In JavaScript environment, the following tools are available:\n"+
+			"Execute a complete JavaScript program in a minimal Goja runtime.\n"+
+				"The input MUST be a self-contained script wrapped exactly as:\n"+
+				"(function() { ... })()\n\n"+
+				"All task logic and ALL tool calls must be inside this single script.\n"+
+				"Call this tool exactly once per turn.\n\n"+
+				"The script must return one final JSON value.\n"+
+				"No logging, async code, or external APIs are available.\n\n"+
+				"The following tool functions are callable inside the script:\n"+
 				docsFragment,
 		),
 		tools.WithArgSchema(CodeArgs{}),
 		tools.WithFunction(executor),
 	)
 
-	systemFragment := "\n\n" + getSystemFragmentJS() + "\n## Additional available JS tools (functions):\n" + docsFragment
+	// create PTC system prompt fragment with tools
+	systemFragment := "\n\n" + getSystemFragmentJS() +
+		"\n## Available JavaScript Tool Functions\n\n" +
+		docsFragment
+
 	return ptcTool, systemFragment, nil
 }
 
@@ -157,8 +140,98 @@ func bindToolToJSVM(vm *goja.Runtime, t tools.Tool) error {
 	return nil
 }
 
+type ArgField struct {
+	Name     string
+	Type     string
+	Required bool
+}
+
+func formatToolSignature(t tools.Tool) string {
+	args := extractArgs(t.ArgumentSchema)
+
+	var fields []string
+	for _, a := range args {
+		name := a.Name
+		if !a.Required {
+			name += "?"
+		}
+		fields = append(fields, fmt.Sprintf("  %s: %s", name, a.Type))
+	}
+
+	argBlock := ""
+	if len(fields) > 0 {
+		argBlock = "{\n" + strings.Join(fields, ",\n") + "\n}"
+	} else {
+		argBlock = "{}"
+	}
+
+	//exampleArgs := buildExampleArgs(args)
+
+	return fmt.Sprintf(
+		`function %s(args: %s): %s
+- %s`,
+		t.Name,
+		argBlock,
+		inferReturnType(t),
+		t.Description,
+	)
+}
+
+func extractArgs(s *schema.JSON) []ArgField {
+	if s == nil || len(s.Properties) == 0 {
+		return nil
+	}
+
+	required := map[string]bool{}
+	for _, r := range s.Required {
+		required[r] = true
+	}
+
+	var args []ArgField
+	for name, prop := range s.Properties {
+		args = append(args, ArgField{
+			Name:     name,
+			Type:     mapJSONSchemaType(prop),
+			Required: required[name],
+		})
+	}
+
+	sort.Slice(args, func(i, j int) bool {
+		return args[i].Name < args[j].Name
+	})
+
+	return args
+}
+
+func inferReturnType(t tools.Tool) string {
+	// If your Tool type exposes return schema, plug it in here.
+	// Otherwise be explicit and conservative.
+	return "json"
+}
+
+func mapJSONSchemaType(s *schema.JSON) string {
+	if s == nil {
+		return "unknown"
+	}
+
+	switch s.Type {
+	case "string":
+		return "string"
+	case "number", "integer":
+		return "number"
+	case "boolean":
+		return "boolean"
+	case "array":
+		return "any[]"
+	case "object":
+		return "object"
+	default:
+		return "unknown"
+	}
+}
+
 // guardRailJS guardrails code before exec; important since LLMs trained for diff. coding objectives
-func guardRailJS(code string) (string, error) { // TODO: add more guardrails
+func guardRailJS(code string) (string, error) { // TODO: add more/update guardrails
 	if code == "" {
 		errMsg := "RuntimeError: No code script provided. Rewrite the code immediately."
 		fmt.Printf("[PTC] Blocked empty code attempt\n")
@@ -183,56 +256,55 @@ func guardRailJS(code string) (string, error) { // TODO: add more guardrails
 	return code, nil
 }
 
-// getSystemFragmentJS returns system prompt fragment for JS PTC tool "code_execution"
 func getSystemFragmentJS() string {
-	return `# JavaScript Execution Environment
-You have access to a **synchronous** JavaScript runtime (goja). Use the 'code_execution' tool to solve the user's request. Assume you have all functions needed to perform the user's task'.
-You can write JS code to solve tasks, and have access to standard JS functions and operations as well as some additional tools (see below), which can be used to assist or solve tasks (e.g., for math or logic problems).
+	return `# Tool Return Conventions
+- Success may return undefined or null.
+- Failure returns a string error.
+- Absence of a return value means success.
+- Always inspect tool return values.
 
-## Strict Execution Rules for JS Code
-1. **MANDATORY SYNTAX (IIFE):** You MUST wrap your entire script in an Immediately Invoked Function Expression: '(function() { ... })()'.
-   - *Reason:* This allows you to use variables, loops, and 'return' statements safely.
-   - *Warning:* Do NOT start your script with '{'. The runtime interprets this as a block, not an object, causing a syntax error.
-2. **SYNCHRONOUS ONLY:** The runtime is blocking, use syncronous functions explicitly. Important: no non-syncronous functions in goja JS.
-3. **NO CONSOLE.LOG:** The 'console' object does not exist. Usage of logging functions will crash the runtime. Return data via the function return only.
-4. **SINGLE TURN:** Fetch all data and perform all logic in a SINGLE execution.
-5. **CALL LIMIT**: Important: You may call 'code_execution' ONLY ONCE per turn, so combine all tasks into a single script. You are penalized for calling 'code_execution'' multiple times.
+# JavaScript Execution Environment (Goja)
 
-## Correct JS code Usage Example 1
-// 1. Wrap logic in (function() { ... })()
-(function() {
-  // 2. Assign tool results to variables (Direct synchronous calls)
-  var joke = askBellman("tell me a joke");
-  var usdAmount = convert_currency({ amount: 100, from: 'USD', to: 'SEK' });
+You are generating a single executable program, not a sequence of tool calls.
 
-  // 3. Perform standard JS logic if needed
-  var isExpensive = usdAmount > 1000;
+This environment executes exactly ONE JavaScript program per turn.
+You must invoke 'code_execution' at most once.
+Inside that program, you may call multiple tool functions as needed.
 
-  // 4. RETURN the final result object
-  return {
-    joke_text: joke,
-    conversion_result: usdAmount,
-    analysis: isExpensive ? "Too expensive" : "Good price"
-  };
-})()
+Execution is part of solving the task.
+You may use execution results to compute the final answer.
 
-## Correct Usage Example 2
-(function() {
-  // 1. Get initial user data by id
-  var user = get_user({ id: "u_12366226" });
-  var stock = null;
+You run in a minimal embedded JavaScript runtime.
+Not Node.js. Not a browser. No async. No console.
 
-  // 2. Use logic: Only fetch stock if user is premium
-  if (user && user.is_premium) {
-     company_id = get_company({ name: "example_company" })
-     stock = get_stock({ company_id: company_id });
-  }
+Only basic JavaScript syntax is available.
+All I/O and side effects must use provided tool functions.
+Tool functions are global. Do NOT prefix them with "functions." or any namespace.
 
-  // 3. Return combined result
-  return {
-    user_data: user,
-    comapny_stock: stock
-  };
-})()
+## When To Use code_execution
+
+Use 'code_execution' ONLY if the task requires tool functions
+(file operations, network, data retrieval, etc).
+
+If no tool is required, respond in natural language.
+Never output JavaScript unless invoking 'code_execution'.
+
+## If Using code_execution
+
+Before invoking 'code_execution', determine ALL required tool calls and combine them into ONE complete script.
+
+- Invoke 'code_execution' exactly once per turn.
+- Provide one complete script wrapped exactly as:
+  (function() { ... })()
+- All logic and tool calls must be inside that script.
+- Assign tool results to variables before using them.
+- Execution is strictly synchronous. Do NOT use async or await.
+- You MUST return one final JSON value from the IIFE.
+- No logging or external APIs.
+
+If you invoke 'code_execution', your entire response must be
+a structured tool call with no text before or after.
+
+Never write code_execution({ ... }) as plain text.
 `
 }
