@@ -28,8 +28,6 @@ func main() {
 		_, _ = w.Write([]byte("OK"))
 	})
 
-	// /generate: simple prompt -> texts[] (used by eval.py when you keep NESTFUL's prompting)
-	mux.HandleFunc("/generate", nestful.NewGenerateHandler(client, defaultModel))
 	// /nestful: benchmark adapter which returns predicted tool call sequence (with/without PTC)
 	mux.HandleFunc("/nestful", nestful.NewNestfulHandler(client, defaultModel))
 
