@@ -176,6 +176,14 @@ func parseNestfulTools(raw []any) ([]tools.Tool, map[string]string, error) {
 				required = append(required, k)
 			}
 		}
+		// NESTFUL tool specs often omit explicit per-parameter required flags.
+		// Default to requiring *all* parameters when none are marked required.
+		if len(required) == 0 {
+			required = make([]string, 0, len(s.Properties))
+			for k := range s.Properties {
+				required = append(required, k)
+			}
+		}
 		if len(required) > 0 {
 			sort.Strings(required)
 			s.Required = required
@@ -213,6 +221,7 @@ func nestfulGeneratedText(res *gen.Response, availableTools []tools.Tool, nameMa
 			out = append(out, seq...)
 			continue
 		}
+
 		args := map[string]any{}
 		_ = json.Unmarshal(tc.Argument, &args)
 		name := tc.Name
@@ -231,10 +240,6 @@ func executeAndExtractNestful(jsCode string, availableTools []tools.Tool, timeou
 	vm := goja.New()
 	var captured []map[string]any
 
-	// Dummy value that survives property access and calls.
-	_, _ = vm.RunString(`var __dummy = function(){ return __dummy; }; __dummy = new Proxy(__dummy, { get: function(){ return __dummy; }, apply: function(){ return __dummy; } });`)
-	dummyVal := vm.Get("__dummy")
-
 	guarded, guardErr := ptc.GuardRailJS(jsCode)
 	if guardErr != nil {
 		return captured, fmt.Sprintf("code_execution guardrail error: %v", guardErr)
@@ -248,6 +253,11 @@ func executeAndExtractNestful(jsCode string, availableTools []tools.Tool, timeou
 	for _, t := range availableTools {
 		tName := t.Name
 		interceptor := func(call goja.FunctionCall) goja.Value {
+			// Reserve the label index for this tool call so the returned placeholder
+			// matches the final label numbering ($var_1, $var_2, ...).
+			idx := len(captured) + 1
+			placeholder := fmt.Sprintf("$var_%d.result$", idx)
+
 			argsMap := make(map[string]any)
 			if len(call.Arguments) > 0 {
 				first := call.Arguments[0].Export()
@@ -262,8 +272,12 @@ func executeAndExtractNestful(jsCode string, availableTools []tools.Tool, timeou
 					}
 				}
 			}
+
+			_ = normalizeVarRefs(argsMap)
 			captured = append(captured, map[string]any{"name": tName, "arguments": argsMap})
-			return dummyVal
+
+			// Return a JS object so the model can use `.result` in subsequent calls.
+			return vm.ToValue(map[string]any{"result": placeholder})
 		}
 		_ = vm.Set(tName, interceptor)
 	}
@@ -271,9 +285,33 @@ func executeAndExtractNestful(jsCode string, availableTools []tools.Tool, timeou
 	if _, err := vm.RunString(guarded); err != nil {
 		return captured, fmt.Sprintf("code_execution run error: %v", err)
 	}
-	fmt.Println(guarded)
-	fmt.Println(captured)
+	fmt.Println("Guarded", guarded)
+	fmt.Println("captured", captured)
 	return captured, ""
+}
+
+// normalizeVarRefs converts nested {"result": "$var_i.result$"} values into the
+// string "$var_i.result$" so arguments match NESTFUL's expected reference format.
+func normalizeVarRefs(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		if len(x) == 1 {
+			if r, ok := x["result"].(string); ok && strings.HasPrefix(r, "$var_") && strings.HasSuffix(r, ".result$") {
+				return r
+			}
+		}
+		for k, vv := range x {
+			x[k] = normalizeVarRefs(vv)
+		}
+		return x
+	case []any:
+		for i := range x {
+			x[i] = normalizeVarRefs(x[i])
+		}
+		return x
+	default:
+		return v
+	}
 }
 
 func isRequired(pdef any) bool {
