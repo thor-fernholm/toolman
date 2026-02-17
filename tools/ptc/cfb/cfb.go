@@ -1,10 +1,12 @@
-package bfcl
+package cfb
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -22,29 +24,96 @@ import (
 )
 
 type BenchmarkRequest struct {
-	Model          string          `json:"bellman_model"`
-	Messages       []Message       `json:"messages"`
-	ToolmanHistory []prompt.Prompt `json:"toolman_history"`
-	Tools          []interface{}   `json:"tools"`
-	Temperature    float64         `json:"temperature"`
-	SystemPrompt   string          `json:"system_prompt"`
-	EnablePTC      bool            `json:"enable_ptc"`
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+	//ToolmanHistory []prompt.Prompt `json:"toolman_history"`
+	Tools       []interface{} `json:"tools"`
+	Temperature float64       `json:"temperature"`
+	//SystemPrompt   string          `json:"system_prompt"`
+	//ToolChoice string `json:"tool_choice"`
+	MaxTokens int  `json:"max_tokens"`
+	EnablePTC bool `json:"enable_ptc"`
 }
 
 type Message struct {
-	Role     string `json:"role"`
-	Content  string `json:"content"`
-	ToolName string `json:"tool_name"`
-	ToolID   string `json:"tool_call_id"`
+	Role      string     `json:"role"`
+	Content   string     `json:"content"`
+	ToolCalls []ToolCall `json:"tool_calls"`
+	ToolName  string     `json:"tool_name"`
+	ToolID    string     `json:"tool_call_id"`
 }
 
-type BenchmarkResponse struct {
-	ToolCalls      []ExtractedCall `json:"tool_calls"`
-	ToolCallIDs    []string        `json:"tool_call_ids"`
-	ToolmanHistory []prompt.Prompt `json:"toolman_history"`
-	Content        string          `json:"content"`       // Any thought/text
-	InputTokens    int             `json:"input_tokens"`  // Added for tracking
-	OutputTokens   int             `json:"output_tokens"` // Added for tracking
+type ChatCompletionResponse struct {
+	ID      string   `json:"id"`
+	Object  string   `json:"object"`
+	Created int64    `json:"created"`
+	Model   string   `json:"model"`
+	Choices []Choice `json:"choices"`
+	Usage   Usage    `json:"usage"`
+}
+
+type Choice struct {
+	Index        int             `json:"index"`
+	Message      ResponseMessage `json:"message"`
+	FinishReason string          `json:"finish_reason"`
+}
+
+type ResponseMessage struct {
+	Role      string     `json:"role"`
+	Content   string     `json:"content"` // Nullable in JSON, empty string in Go
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+}
+
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function ToolCallFunction `json:"function"`
+}
+
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"` // Vital: This is a stringified JSON blob
+}
+
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+//type BenchmarkResponse struct {
+//	Choice Choice `json:"choice"`
+//	//ToolCalls   []ExtractedCall `json:"tool_calls"`
+//	//ToolCallIDs []string        `json:"tool_call_ids"`
+//	//ToolmanHistory []prompt.Prompt `json:"toolman_history"`
+//	//Content      string `json:"content"`       // Any thought/text
+//	InputTokens  int `json:"input_tokens"`  // Added for tracking
+//	OutputTokens int `json:"output_tokens"` // Added for tracking
+//}
+//
+//type Choice struct {
+//	Content   string     `json:"content"`
+//	ToolCalls []ToolCall `json:"tool_calls"`
+//}
+//
+//type ToolCall struct {
+//	ID       string           `json:"id"`
+//	Type     string           `json:"type"`
+//	Function ToolCallFunction `json:"function"`
+//}
+//
+//type ToolCallFunction struct {
+//	Name      string `json:"name"`
+//	Arguments string `json:"arguments"`
+//}
+
+// ExtractedCall: The structure of a single tool call found during execution
+type ExtractedCall map[string]map[string]interface{}
+
+// ExecutionResult holds both the calls found and the final return value of the script
+type ExecutionResult struct {
+	Calls []ExtractedCall `json:"tool_calls"`
+	Error error           `json:"error"`
 }
 
 var (
@@ -52,7 +121,7 @@ var (
 	GlobalOutputTokens uint64
 )
 
-func HandleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
+func HandleGenerateCFB(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -68,57 +137,42 @@ func HandleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 
 	bellmanUrl := os.Getenv("BELLMAN_URL")
 	bellmanToken := os.Getenv("BELLMAN_TOKEN")
-	client := bellman.New(bellmanUrl, bellman.Key{Name: "bfcl", Token: bellmanToken})
+	client := bellman.New(bellmanUrl, bellman.Key{Name: "cfb", Token: bellmanToken})
 
 	bfclTools := ParseJsonSchemaTools(req.Tools, req.EnablePTC)
 
-	toolmanHistory := req.ToolmanHistory
-
-	// count toolman user messages
-	toolmanUserCount := 0
-	for _, p := range toolmanHistory {
-		if p.Role == prompt.UserRole {
-			toolmanUserCount++
-		}
-	}
-	// add trailing messages from BFCL
-	bfclUserCount := 0
-	for _, m := range req.Messages {
+	// parse CFB messages to toolman history
+	var toolmanHistory []prompt.Prompt
+	for i, m := range req.Messages {
 		switch m.Role {
 		case "user":
-			// only add new user messages from bfcl (not in toolman hist.)
-			bfclUserCount++
-			if bfclUserCount > toolmanUserCount {
-				toolmanHistory = append(toolmanHistory, prompt.AsUser(m.Content))
-			}
-		}
-	}
-
-	// Add tool response after call!
-	var rebuiltHistory []prompt.Prompt
-	for i, p := range toolmanHistory {
-		switch p.Role {
-		case prompt.ToolCallRole:
-			rebuiltHistory = append(rebuiltHistory, p)
-			// find all corresponding tool results and concatenate
-			var concatenatedReturns []string
-			for j := 0; j < len(req.Messages); j++ {
-				if req.Messages[j].Role == "tool_response" && req.Messages[j].ToolID == p.ToolCall.ToolCallID {
-					concatenatedReturns = append(concatenatedReturns, fmt.Sprintf("Function '%s' result: %s.", req.Messages[j].ToolName, req.Messages[j].Content))
+			toolmanHistory = append(toolmanHistory, prompt.AsUser(m.Content))
+		case "assistant":
+			// tool calls
+			if m.Content == "" && m.ToolCalls != nil {
+				for _, t := range m.ToolCalls {
+					toolmanHistory = append(toolmanHistory, prompt.AsToolCall(t.ID, t.Function.Name, []byte(t.Function.Arguments)))
+					// add corresponding tool responses (can be multiple with PTC)
+					var concatenatedResponses []string
+					for j := i + 1; j < len(req.Messages); j++ {
+						if req.Messages[j].Role == "tool" && req.Messages[j].ToolID == t.ID {
+							concatenatedResponses = append(concatenatedResponses, fmt.Sprintf("Function '%s' result: %s.", req.Messages[j].ToolName, req.Messages[j].Content))
+						}
+					}
+					toolmanHistory = append(toolmanHistory, prompt.AsToolResponse(t.ID, t.Function.Name, strings.Join(concatenatedResponses, "\n")))
+					// TODO: add JS runtime errors?
 				}
+			} else { // assistant text response
+				toolmanHistory = append(toolmanHistory, prompt.AsAssistant(m.Content))
 			}
-			// add JS runtime errors to tool response
-			if len(toolmanHistory) > i+1 {
-				nextPrompt := toolmanHistory[i+1]
-				if nextPrompt.Role == prompt.ToolResponseRole && nextPrompt.ToolResponse.ToolCallID == p.ToolCall.ToolCallID {
-					concatenatedReturns = append(concatenatedReturns, nextPrompt.ToolResponse.Response)
-				}
-			}
-			rebuiltHistory = append(rebuiltHistory, prompt.AsToolResponse(p.ToolCall.ToolCallID, p.ToolCall.Name, strings.Join(concatenatedReturns, "\n")))
-		case prompt.UserRole:
-			rebuiltHistory = append(rebuiltHistory, p)
-			//case prompt.AssistantRole: // <-- assistant should only come from toolman response, not added here!
-			//	rebuiltHistory = append(rebuiltHistory, p)
+		case "tool":
+			fmt.Println("tool already added...")
+			//toolmanHistory = append(toolmanHistory, prompt.AsToolResponse(m.ToolID, m.ToolName, m.Content))
+			//toolmanHistory = append(toolmanHistory, prompt.AsToolCall(m.ToolID, m.ToolName, []byte(m.Content)))
+		case "observation":
+			log.Fatalf("error: unknown type 'observation' in message: %v", m)
+			return
+			//toolmanHistory = append(toolmanHistory, prompt.AsToolResponse(m.ToolID, m.ToolName, m.Content))
 		}
 	}
 
@@ -128,18 +182,13 @@ func HandleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 	}
 	//model = openai.GenModel_gpt4_1_mini_250414
 
-	// remove bfcl prompt for PTC - misleading!
-	if req.EnablePTC {
-		req.SystemPrompt = ""
-	}
-
 	llm := client.Generator().Model(model).
-		System(req.SystemPrompt).
+		System(""). // TODO: check if system prompt available?
 		SetTools(bfclTools...).
 		SetPTCLanguage(tools.JavaScript).
 		Temperature(req.Temperature)
 
-	res, err := llm.Prompt(rebuiltHistory...)
+	res, err := llm.Prompt(toolmanHistory...)
 	if err != nil {
 		log.Printf("Prompt Error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -160,22 +209,83 @@ func HandleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 		atomic.LoadUint64(&GlobalInputTokens), atomic.LoadUint64(&GlobalOutputTokens))
 
 	// extract individual new tool calls for bfcl + toolman
-	extractedCalls, toolmanCalls, toolCallIDs, err := GetToolCalls(res, bfclTools)
+	_, toolmanCalls, _, err := GetToolCalls(res, bfclTools)
 
 	// add new toolman calls to conversation history
-	toolmanHistory = append(rebuiltHistory, toolmanCalls...)
+	//toolmanHistory = append(toolmanHistory, toolmanCalls...)
 
-	resp := BenchmarkResponse{
-		ToolCalls:      extractedCalls,
-		ToolCallIDs:    toolCallIDs,
-		ToolmanHistory: toolmanHistory,
-		Content:        "Tool calls generated", // TODO <-- is this used in bfcl?
-		InputTokens:    res.Metadata.InputTokens,
-		OutputTokens:   res.Metadata.OutputTokens,
+	var toolCalls []ToolCall
+	for _, c := range toolmanCalls {
+		tc := ToolCall{
+			ID:   c.ToolCall.ToolCallID,
+			Type: "function",
+			Function: ToolCallFunction{
+				Name:      c.ToolCall.Name,
+				Arguments: string(c.ToolCall.Arguments),
+			},
+		}
+		toolCalls = append(toolCalls, tc)
 	}
+
+	content := ""
+	if res.IsText() {
+		if content, err = res.AsText(); err != nil {
+			log.Printf("error: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	finishReason := "stop"
+	if res.IsTools() {
+		finishReason = "tool_calls"
+	}
+
+	// TODO: add JS runtime errors?
+	resp := ChatCompletionResponse{
+		ID:      "chatcmpl-123",
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   model.String(),
+		Choices: []Choice{{
+			Index: 0,
+			Message: ResponseMessage{
+				Role:      "assistant",
+				Content:   content,
+				ToolCalls: toolCalls,
+			},
+			FinishReason: finishReason,
+		},
+		},
+		Usage: Usage{
+			PromptTokens:     inputTokens,
+			CompletionTokens: outputTokens,
+			TotalTokens:      inputTokens + outputTokens,
+		},
+	}
+
+	//resp := BenchmarkResponse{
+	//	Choice: Choice{
+	//		Content:   toolmanCalls[0].Text,
+	//		ToolCalls: toolCalls,
+	//	},
+	//	InputTokens:  res.Metadata.InputTokens,
+	//	OutputTokens: res.Metadata.OutputTokens,
+	//}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func PrintRequest(r *http.Request) {
+	bodyBytes, _ := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	var prettyJSON bytes.Buffer
+	if err := json.Indent(&prettyJSON, bodyBytes, "", "  "); err != nil {
+		fmt.Printf("Received Raw Body: %s\n", string(bodyBytes))
+	} else {
+		fmt.Printf("Received Pretty JSON:\n%s\n", prettyJSON.String())
+	}
 }
 
 // Regex to find invalid characters (only letters, numbers, underscores, dashes allowed)
@@ -337,15 +447,6 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCa
 	}
 
 	return calls, toolCalls, toolIDs, nil
-}
-
-// ExtractedCall: The structure of a single tool call found during execution
-type ExtractedCall map[string]map[string]interface{}
-
-// ExecutionResult holds both the calls found and the final return value of the script
-type ExecutionResult struct {
-	Calls []ExtractedCall `json:"tool_calls"`
-	Error error           `json:"error"`
 }
 
 func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionResult {

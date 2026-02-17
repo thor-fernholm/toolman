@@ -172,7 +172,7 @@ func formatToolSignature(t tools.Tool) string {
 - %s`,
 		t.Name,
 		argBlock,
-		inferReturnType(t),
+		inferReturnType(t), // TODO: proper infer types?
 		t.Description,
 	)
 }
