@@ -42,7 +42,7 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 			return "", err
 		}
 
-		code, err := guardRailJS(arg.Code)
+		code, err := GuardRailJS(arg.Code)
 		if err != nil {
 			return err.Error(), nil
 		}
@@ -231,7 +231,7 @@ func mapJSONSchemaType(s *schema.JSON) string {
 }
 
 // guardRailJS guardrails code before exec; important since LLMs trained for diff. coding objectives
-func guardRailJS(code string) (string, error) { // TODO: add more/update guardrails
+func GuardRailJS(code string) (string, error) { // TODO: add more/update guardrails
 	if code == "" {
 		errMsg := "RuntimeError: No code script provided. Rewrite the code immediately."
 		fmt.Printf("[PTC] Blocked empty code attempt\n")

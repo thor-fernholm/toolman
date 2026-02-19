@@ -15,6 +15,7 @@ import (
 	"github.com/modfin/bellman/prompt"
 	"github.com/modfin/bellman/tools"
 	"github.com/modfin/bellman/tools/ptc/bfcl"
+	"github.com/modfin/bellman/tools/ptc/nestful"
 )
 
 type BenchmarkRequest struct {
@@ -57,6 +58,7 @@ func main() {
 
 	// Register API Endpoint
 	http.HandleFunc("/bfcl", bfcl.MiddlewareDebugLogger(handleGenerateBFCL))
+	http.HandleFunc("/nestful", nestful.NesfulHandlerFromEnv())
 
 	// Register Debug UI Endpoints
 	http.HandleFunc("/debug", bfcl.HandleDebugUI)
