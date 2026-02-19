@@ -11,6 +11,7 @@ import (
 	"github.com/dop251/goja"
 	"github.com/joho/godotenv"
 	"github.com/modfin/bellman/agent"
+	"github.com/modfin/bellman/models/embed"
 	"github.com/modfin/bellman/models/gen"
 	"github.com/modfin/bellman/prompt"
 	"github.com/modfin/bellman/services/anthropic"
@@ -18,6 +19,7 @@ import (
 	"github.com/modfin/bellman/services/vertexai"
 	"github.com/modfin/bellman/tools"
 	"github.com/modfin/bellman/tools/ptc"
+	"github.com/wizenheimer/comet"
 )
 
 func TestToolman(t *testing.T) {
@@ -71,6 +73,70 @@ func TestToolman(t *testing.T) {
 
 		// pretty print
 		prettyPrint(res)
+	}
+}
+
+func TestVectorSearch(t *testing.T) {
+	// get env vars
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+	bellmanUrl := os.Getenv("BELLMAN_URL")
+	bellmanToken := os.Getenv("BELLMAN_TOKEN")
+
+	allTools := ptc.GetMockBellmanTools(true)
+
+	// create Bellman client
+	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
+
+	// embed all tool descr and index
+	log.Printf("embedding tool descriptions")
+	dimension := 1536
+	vecIdx, _ := comet.NewFlatIndex(dimension, comet.Cosine)
+	bmIdx := comet.NewBM25SearchIndex()
+	hybrid := comet.NewHybridSearchIndex(vecIdx, bmIdx, nil)
+	for _, t := range allTools {
+		res, _ := client.Embed(embed.NewSingleRequest(
+			context.Background(),
+			openai.EmbedModel_text3_small.WithType(embed.TypeDocument),
+			t.Description,
+		))
+		log.Printf("Tokens used: %v - cost: $%v\n", res.Metadata.TotalTokens, float64(res.Metadata.TotalTokens)/(800*62_500))
+
+		vec, _ := res.SingleAsFloat32()
+		//node := comet.NewVectorNode(vec)
+		//vecIdx.Add(*node)
+		hybrid.Add(vec, t.Description, nil)
+	}
+
+	// query index with cosine sim
+	query := "i have japanese currency and want to exchange to dollar"
+	log.Printf(" ---- search query: %s", query)
+	res, _ := client.Embed(embed.NewSingleRequest(
+		context.Background(),
+		openai.EmbedModel_text3_small.WithType(embed.TypeQuery),
+		query,
+	))
+	q, _ := res.SingleAsFloat32()
+	//results, _ := idx.NewSearch().
+	//	WithQuery(q).
+	//	WithK(5).
+	//	Execute()
+
+	// Search hybrid
+	results, err := hybrid.NewSearch().
+		WithVector(q).
+		WithText(query).
+		WithFusionKind(comet.ReciprocalRankFusion). // Combine rankings
+		WithK(2).
+		Execute()
+
+	// Return relevant documents
+	for _, result := range results {
+		log.Printf("Found: %s (similarity: %.4f)",
+			//allTools[result.GetId()-1].Description, 1-result.GetScore())
+			allTools[result.GetId()-1].Description, result.GetScore())
 	}
 }
 
