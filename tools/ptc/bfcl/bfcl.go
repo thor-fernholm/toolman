@@ -432,12 +432,15 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionRes
 		if !errors.As(err, &evalErr) {
 			// If it's a real runtime error, just log it.
 			// We DO NOT return the error to the caller, because we want the partial results.
+			err = fmt.Errorf("javascript runtime error: %s", err)
 			fmt.Printf("[warning] JS Runtime Error: %v\n", err)
 		}
 	}
 
+	fmt.Printf("________ Code:\n%v\n", jsCode)
+
 	return &ExecutionResult{
 		Calls: capturedCalls,
-		Error: fmt.Errorf("javascript runtime error: %s", err),
+		Error: err,
 	}
 }

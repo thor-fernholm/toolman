@@ -18,13 +18,13 @@ func main() {
 	}
 
 	// Register API Endpoint
-	http.HandleFunc("/bfcl", bfcl.MiddlewareDebugLogger("BFCL", bfcl.HandleGenerateBFCL))
-	http.HandleFunc("/cfb", bfcl.MiddlewareDebugLogger("CFB", cfb.HandleGenerateCFB))
+	http.HandleFunc("/bfcl", MiddlewareDebugLogger("BFCL", bfcl.HandleGenerateBFCL))
+	http.HandleFunc("/cfb", MiddlewareDebugLogger("CFB", cfb.HandleGenerateCFB))
 
 	// Register Debug UI Endpoints
-	http.HandleFunc("/debug", bfcl.HandleDebugUI)
-	http.HandleFunc("/debug/api/data", bfcl.HandleDebugData)
-	http.HandleFunc("/debug/api/clear", bfcl.HandleDebugClear)
+	http.HandleFunc("/debug", HandleDebugUI)
+	http.HandleFunc("/debug/api/data", HandleDebugData)
+	http.HandleFunc("/debug/api/clear", HandleDebugClear)
 
 	fmt.Println("---------------------------------------------------------")
 	fmt.Println(" Toolman Bench Server Running")

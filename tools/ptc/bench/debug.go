@@ -1,4 +1,4 @@
-package bfcl
+package main
 
 import (
 	"bytes"
@@ -125,7 +125,7 @@ func MiddlewareDebugLogger(endpointName string, next http.HandlerFunc) http.Hand
 			// Switch Logic based on Endpoint
 			if endpointName == "CFB" {
 				// --- HANDLE OPENAI FORMAT (CFB) ---
-				type CfbResponse struct {
+				type CfbCompletion struct {
 					Choices []struct {
 						Message struct {
 							Content   string      `json:"content"`
@@ -137,23 +137,20 @@ func MiddlewareDebugLogger(endpointName string, next http.HandlerFunc) http.Hand
 						CompletionTokens int `json:"completion_tokens"`
 					} `json:"usage"`
 				}
+				type CfbResponse struct {
+					Completion     CfbCompletion   `json:"completion"`
+					ToolmanHistory []prompt.Prompt `json:"toolman_history"`
+					ToolmanCalls   []prompt.Prompt `json:"toolman_calls"`
+				}
 				var resp CfbResponse
 				_ = json.Unmarshal(rw.body.Bytes(), &resp)
 
-				inputTokens = resp.Usage.PromptTokens
-				outputTokens = resp.Usage.CompletionTokens
+				inputTokens = resp.Completion.Usage.PromptTokens
+				outputTokens = resp.Completion.Usage.CompletionTokens
+				rawContent = extractLLMContent(resp.ToolmanHistory)
 
-				if len(resp.Choices) > 0 {
-					extractedTools = resp.Choices[0].Message.ToolCalls
-					if resp.Choices[0].Message.Content != "" {
-						rawContent = []string{resp.Choices[0].Message.Content}
-					} else {
-						//for _, call := range resp.Choices[0].Message.ToolCalls.([]interface{}) {
-						//
-						//}
-						//rawContent = resp.Choices[0].Message.ToolCalls
-						rawContent = []string{"(No text content)"}
-					}
+				if len(resp.Completion.Choices) > 0 {
+					extractedTools = resp.Completion.Choices[0].Message.ToolCalls
 				}
 
 			} else {

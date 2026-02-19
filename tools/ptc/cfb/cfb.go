@@ -24,15 +24,16 @@ import (
 )
 
 type BenchmarkRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	//ToolmanHistory []prompt.Prompt `json:"toolman_history"`
+	Model       string        `json:"model"`
+	Messages    []Message     `json:"messages"`
 	Tools       []interface{} `json:"tools"`
 	Temperature float64       `json:"temperature"`
 	//SystemPrompt   string          `json:"system_prompt"`
 	//ToolChoice string `json:"tool_choice"`
-	MaxTokens int  `json:"max_tokens"`
-	EnablePTC bool `json:"enable_ptc"`
+	MaxTokens      int             `json:"max_tokens"`
+	EnablePTC      bool            `json:"enable_ptc"`
+	ToolmanHistory []prompt.Prompt `json:"toolman_history"`
+	ToolmanCalls   []prompt.Prompt `json:"toolman_calls"`
 }
 
 type Message struct {
@@ -41,6 +42,12 @@ type Message struct {
 	ToolCalls []ToolCall `json:"tool_calls"`
 	ToolName  string     `json:"tool_name"`
 	ToolID    string     `json:"tool_call_id"`
+}
+
+type BenchmarkResponse struct {
+	Completion     ChatCompletionResponse `json:"completion"`
+	ToolmanHistory []prompt.Prompt        `json:"toolman_history"`
+	ToolmanCalls   []prompt.Prompt        `json:"toolman_calls"`
 }
 
 type ChatCompletionResponse struct {
@@ -81,39 +88,13 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
-//type BenchmarkResponse struct {
-//	Choice Choice `json:"choice"`
-//	//ToolCalls   []ExtractedCall `json:"tool_calls"`
-//	//ToolCallIDs []string        `json:"tool_call_ids"`
-//	//ToolmanHistory []prompt.Prompt `json:"toolman_history"`
-//	//Content      string `json:"content"`       // Any thought/text
-//	InputTokens  int `json:"input_tokens"`  // Added for tracking
-//	OutputTokens int `json:"output_tokens"` // Added for tracking
-//}
-//
-//type Choice struct {
-//	Content   string     `json:"content"`
-//	ToolCalls []ToolCall `json:"tool_calls"`
-//}
-//
-//type ToolCall struct {
-//	ID       string           `json:"id"`
-//	Type     string           `json:"type"`
-//	Function ToolCallFunction `json:"function"`
-//}
-//
-//type ToolCallFunction struct {
-//	Name      string `json:"name"`
-//	Arguments string `json:"arguments"`
-//}
-
 // ExtractedCall: The structure of a single tool call found during execution
 type ExtractedCall map[string]map[string]interface{}
 
 // ExecutionResult holds both the calls found and the final return value of the script
 type ExecutionResult struct {
-	Calls []ExtractedCall `json:"tool_calls"`
-	Error error           `json:"error"`
+	Calls []ToolCall `json:"tool_calls"`
+	Error error      `json:"error"`
 }
 
 var (
@@ -135,45 +116,68 @@ func HandleGenerateCFB(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(req.Messages) > 1 {
+		log.Printf("------received multiple messages: %v\n", req.Messages)
+	}
+
 	bellmanUrl := os.Getenv("BELLMAN_URL")
 	bellmanToken := os.Getenv("BELLMAN_TOKEN")
 	client := bellman.New(bellmanUrl, bellman.Key{Name: "cfb", Token: bellmanToken})
 
 	bfclTools := ParseJsonSchemaTools(req.Tools, req.EnablePTC)
 
-	// parse CFB messages to toolman history
-	var toolmanHistory []prompt.Prompt
-	for i, m := range req.Messages {
+	toolmanHistory := req.ToolmanHistory
+
+	// count toolman user messages
+	toolmanUserCount := 0
+	for _, p := range toolmanHistory {
+		if p.Role == prompt.UserRole {
+			toolmanUserCount++
+		}
+	}
+	// add trailing messages from BFCL
+	bfclUserCount := 0
+	for _, m := range req.Messages {
 		switch m.Role {
 		case "user":
-			toolmanHistory = append(toolmanHistory, prompt.AsUser(m.Content))
-		case "assistant":
-			// tool calls
-			if m.Content == "" && m.ToolCalls != nil {
-				for _, t := range m.ToolCalls {
-					toolmanHistory = append(toolmanHistory, prompt.AsToolCall(t.ID, t.Function.Name, []byte(t.Function.Arguments)))
-					// add corresponding tool responses (can be multiple with PTC)
-					var concatenatedResponses []string
-					for j := i + 1; j < len(req.Messages); j++ {
-						if req.Messages[j].Role == "tool" && req.Messages[j].ToolID == t.ID {
-							concatenatedResponses = append(concatenatedResponses, fmt.Sprintf("Function '%s' result: %s.", req.Messages[j].ToolName, req.Messages[j].Content))
-						}
-					}
-					toolmanHistory = append(toolmanHistory, prompt.AsToolResponse(t.ID, t.Function.Name, strings.Join(concatenatedResponses, "\n")))
-					// TODO: add JS runtime errors?
-				}
-			} else { // assistant text response
-				toolmanHistory = append(toolmanHistory, prompt.AsAssistant(m.Content))
+			// only add new user messages from bfcl (not in toolman hist.)
+			bfclUserCount++
+			if bfclUserCount > toolmanUserCount {
+				toolmanHistory = append(toolmanHistory, prompt.AsUser(m.Content))
 			}
-		case "tool":
-			fmt.Println("tool already added...")
-			//toolmanHistory = append(toolmanHistory, prompt.AsToolResponse(m.ToolID, m.ToolName, m.Content))
-			//toolmanHistory = append(toolmanHistory, prompt.AsToolCall(m.ToolID, m.ToolName, []byte(m.Content)))
-		case "observation":
-			log.Fatalf("error: unknown type 'observation' in message: %v", m)
-			return
-			//toolmanHistory = append(toolmanHistory, prompt.AsToolResponse(m.ToolID, m.ToolName, m.Content))
 		}
+	}
+
+	// Add tool response after call!
+	var rebuiltHistory []prompt.Prompt
+	for i, p := range toolmanHistory {
+		switch p.Role {
+		case prompt.ToolCallRole:
+			rebuiltHistory = append(rebuiltHistory, p)
+			// find all corresponding tool results and concatenate
+			var concatenatedReturns []string
+			for j := 0; j < len(req.Messages); j++ {
+				if req.Messages[j].Role == "tool" && req.Messages[j].ToolID == p.ToolCall.ToolCallID {
+					concatenatedReturns = append(concatenatedReturns, fmt.Sprintf("Function '%s' result: %s.", req.Messages[j].ToolName, req.Messages[j].Content))
+				}
+			}
+			// add JS runtime errors to tool response
+			if len(toolmanHistory) > i+1 {
+				nextPrompt := toolmanHistory[i+1]
+				if nextPrompt.Role == prompt.ToolResponseRole && nextPrompt.ToolResponse.ToolCallID == p.ToolCall.ToolCallID {
+					concatenatedReturns = append(concatenatedReturns, nextPrompt.ToolResponse.Response)
+				}
+			}
+			rebuiltHistory = append(rebuiltHistory, prompt.AsToolResponse(p.ToolCall.ToolCallID, p.ToolCall.Name, strings.Join(concatenatedReturns, "\n")))
+		case prompt.UserRole:
+			rebuiltHistory = append(rebuiltHistory, p)
+			//case prompt.AssistantRole: // <-- assistant should only come from toolman response, not added here!
+			//	rebuiltHistory = append(rebuiltHistory, p)
+		}
+	}
+
+	if len(req.Messages) > 1 {
+		log.Printf("------rebuilt toolman history: %v\n", rebuiltHistory)
 	}
 
 	model, err := gen.ToModel(req.Model)
@@ -188,7 +192,7 @@ func HandleGenerateCFB(w http.ResponseWriter, r *http.Request) {
 		SetPTCLanguage(tools.JavaScript).
 		Temperature(req.Temperature)
 
-	res, err := llm.Prompt(toolmanHistory...)
+	res, err := llm.Prompt(rebuiltHistory...)
 	if err != nil {
 		log.Printf("Prompt Error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -209,23 +213,14 @@ func HandleGenerateCFB(w http.ResponseWriter, r *http.Request) {
 		atomic.LoadUint64(&GlobalInputTokens), atomic.LoadUint64(&GlobalOutputTokens))
 
 	// extract individual new tool calls for bfcl + toolman
-	_, toolmanCalls, _, err := GetToolCalls(res, bfclTools)
+	extractedCalls, toolmanCalls, err := GetToolCalls(res, bfclTools)
+
+	if err != nil {
+		log.Fatalf("error: %e", err)
+	}
 
 	// add new toolman calls to conversation history
-	//toolmanHistory = append(toolmanHistory, toolmanCalls...)
-
-	var toolCalls []ToolCall
-	for _, c := range toolmanCalls {
-		tc := ToolCall{
-			ID:   c.ToolCall.ToolCallID,
-			Type: "function",
-			Function: ToolCallFunction{
-				Name:      c.ToolCall.Name,
-				Arguments: string(c.ToolCall.Arguments),
-			},
-		}
-		toolCalls = append(toolCalls, tc)
-	}
+	toolmanHistory = append(toolmanHistory, toolmanCalls...)
 
 	content := ""
 	if res.IsText() {
@@ -241,9 +236,8 @@ func HandleGenerateCFB(w http.ResponseWriter, r *http.Request) {
 		finishReason = "tool_calls"
 	}
 
-	// TODO: add JS runtime errors?
-	resp := ChatCompletionResponse{
-		ID:      "chatcmpl-123",
+	completion := ChatCompletionResponse{
+		ID:      "chatcmpl-123", // Important: fill with mock data! (for completion parsing in cfb)
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
 		Model:   model.String(),
@@ -252,7 +246,7 @@ func HandleGenerateCFB(w http.ResponseWriter, r *http.Request) {
 			Message: ResponseMessage{
 				Role:      "assistant",
 				Content:   content,
-				ToolCalls: toolCalls,
+				ToolCalls: extractedCalls,
 			},
 			FinishReason: finishReason,
 		},
@@ -264,14 +258,11 @@ func HandleGenerateCFB(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	//resp := BenchmarkResponse{
-	//	Choice: Choice{
-	//		Content:   toolmanCalls[0].Text,
-	//		ToolCalls: toolCalls,
-	//	},
-	//	InputTokens:  res.Metadata.InputTokens,
-	//	OutputTokens: res.Metadata.OutputTokens,
-	//}
+	resp := BenchmarkResponse{
+		Completion:     completion,
+		ToolmanHistory: toolmanHistory,
+		ToolmanCalls:   toolmanCalls,
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -303,7 +294,7 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 			Parameters  json.RawMessage `json:"parameters"`
 		}
 
-		// Handle BFCL's nested "function" wrapper if present
+		// Handle CFB's nested "function" wrapper if present
 		var wrapper struct {
 			Function json.RawMessage `json:"function"`
 		}
@@ -374,16 +365,26 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 		parsedTools = append(parsedTools, tool)
 	}
 
+	// Marshal with indentation (prefix="", indent="  ")
+	prettyJSON, err := json.MarshalIndent(rawTools[0], "", "  ")
+	prettyJSON2, err2 := json.MarshalIndent(parsedTools[0], "", "  ")
+	if err != nil || err2 != nil {
+		fmt.Printf("Failed to marshal args: %v", err)
+	} else {
+		fmt.Printf("First raw tool:\n%s", string(prettyJSON))
+		fmt.Printf("First toolman tool:\n%s", string(prettyJSON2))
+	}
+
 	return parsedTools
 }
 
 // GetToolCalls extracts calls in the Ground Truth format: [{"func": {"arg": val}}]
-func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCall, []prompt.Prompt, []string, error) {
-	// BFCL
-	var calls []ExtractedCall
+func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ToolCall, []prompt.Prompt, error) {
+	// CFB
+	var calls []ToolCall
 	// Toolman
 	var toolCalls []prompt.Prompt
-	var toolIDs []string
+	//var toolIDs []string
 
 	if !res.IsTools() { // --> res.IsText()
 		text, err := res.AsText()
@@ -391,7 +392,7 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCa
 			log.Fatalf("error: %e", err)
 		}
 		assistant := []prompt.Prompt{prompt.AsAssistant(text)}
-		return calls, assistant, toolIDs, nil
+		return calls, assistant, nil
 	}
 
 	for i, tool := range res.Tools {
@@ -404,13 +405,11 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCa
 			if err := json.Unmarshal(tool.Argument, &codeArgs); err == nil {
 				// Run the Extractor
 				execResult := ExecuteAndExtract(codeArgs.Code, availableTools)
-				// Append all calls found in the JS code
-				calls = append(calls, execResult.Calls...)
-
-				// add ID for each bfcl tool call
-				for range execResult.Calls {
-					toolIDs = append(toolIDs, tool.ID)
+				// Append all calls found in the JS code (with correct ID)
+				for _, c := range execResult.Calls {
+					c.ID = tool.ID
 				}
+				calls = append(calls, execResult.Calls...)
 
 				// add toolman call + ID & check for JS execution errors!
 				toolCalls = append(toolCalls, prompt.AsToolCall(tool.ID, tool.Name, tool.Argument))
@@ -437,16 +436,21 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCa
 
 		fmt.Printf("Tool call %v: name: %v, args: %v\n", i, tool.Name, tool.Argument)
 		toolCalls = append(toolCalls, prompt.AsToolCall(tool.ID, tool.Name, tool.Argument))
-		toolIDs = append(toolIDs, tool.ID)
+		//toolIDs = append(toolIDs, tool.ID)
 
 		// Construct the entry
-		entry := ExtractedCall{
-			tool.Name: argsMap,
+		entry := ToolCall{
+			ID:   tool.ID,
+			Type: "function",
+			Function: ToolCallFunction{
+				Name:      tool.Name,
+				Arguments: string(tool.Argument),
+			},
 		}
 		calls = append(calls, entry)
 	}
 
-	return calls, toolCalls, toolIDs, nil
+	return calls, toolCalls, nil
 }
 
 func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionResult {
@@ -458,7 +462,7 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionRes
 	}()
 
 	vm := goja.New()
-	var capturedCalls []ExtractedCall
+	var capturedCalls []ToolCall
 
 	// TIMEOUT SAFETY: Prevent infinite loops (e.g. while(true))
 	// Interrupt execution after 500ms.
@@ -484,32 +488,47 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionRes
 		// INTERCEPTOR: Runs when JS calls a tool
 		interceptor := func(call goja.FunctionCall) goja.Value {
 			argsMap := make(map[string]interface{})
-			// ROBUST ARG PARSING: Handle any argument style
+
+			// ROBUST ARG PARSING
 			if len(call.Arguments) > 0 {
+				// Export() converts goja.Value to Go interface{}
 				firstArg := call.Arguments[0].Export()
 
-				// Scenario A: Standard BFCL (First arg is a Dictionary)
-				// tool({ "arg": 1 })
+				// Scenario A: Standard (First arg is a Dictionary/Object)
 				if obj, ok := firstArg.(map[string]interface{}); ok {
 					for k, v := range obj {
 						argsMap[k] = v
 					}
 				} else {
-					// Scenario B: Hallucinated Positional Args
-					// tool("value", 123)
-					// We capture them with generic keys so we don't lose data.
+					// Scenario B: Positional Args or Non-Object
+					// We capture them with generic keys
 					argsMap["__arg_0__"] = firstArg
-					for i := 1; i < len(call.Arguments); i++ {
-						fmt.Printf("[Fix] caught a previous js extract error...")
-						key := fmt.Sprintf("__arg_%d__", i)
-						argsMap[key] = call.Arguments[i].Export()
-					}
+				}
+
+				// Capture remaining positional arguments if any
+				for i := 1; i < len(call.Arguments); i++ {
+					key := fmt.Sprintf("__arg_%d__", i)
+					argsMap[key] = call.Arguments[i].Export()
 				}
 			}
 
+			// parse json into string
+			argsBytes, err := json.Marshal(argsMap)
+			argsStr := "{}"
+			if err == nil {
+				argsStr = string(argsBytes)
+			} else {
+				fmt.Printf("[Warning] Failed to marshal args for %s: %v\n", tName, err)
+			}
+
 			// Record the call
-			capturedCalls = append(capturedCalls, ExtractedCall{
-				tName: argsMap,
+			capturedCalls = append(capturedCalls, ToolCall{
+				ID:   "", // should be replaced later
+				Type: "function",
+				Function: ToolCallFunction{
+					Name:      tName,
+					Arguments: argsStr,
+				},
 			})
 
 			// Return generic mock to keep script running
@@ -533,12 +552,15 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionRes
 		if !errors.As(err, &evalErr) {
 			// If it's a real runtime error, just log it.
 			// We DO NOT return the error to the caller, because we want the partial results.
+			err = fmt.Errorf("javascript runtime error: %s", err)
 			fmt.Printf("[warning] JS Runtime Error: %v\n", err)
 		}
 	}
 
+	fmt.Printf("________ Code:\n%v\n", jsCode)
+
 	return &ExecutionResult{
 		Calls: capturedCalls,
-		Error: fmt.Errorf("javascript runtime error: %s", err),
+		Error: err,
 	}
 }
