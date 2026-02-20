@@ -2,9 +2,17 @@ package ptc
 
 import (
 	"fmt"
+	"sync"
 
+	"github.com/dop251/goja"
 	"github.com/modfin/bellman/tools"
 )
+
+type Runtime struct {
+	Mutex sync.Mutex // Only one operator at a time --> prevent unexpected concurrency runtime errors
+	JS    *goja.Runtime
+	// Python *python.Environment <-- other code exec vm envs.
+}
 
 // ExtractPTCTools separates regular tools from PTC tools and returns both slices
 func ExtractPTCTools(inputTools []tools.Tool) ([]tools.Tool, []tools.Tool) {
@@ -23,16 +31,17 @@ func ExtractPTCTools(inputTools []tools.Tool) ([]tools.Tool, []tools.Tool) {
 }
 
 // AdaptToolsToPTC converts a list of Bellman tools into a single PTC tool with code execution environment
-func AdaptToolsToPTC(ptcTools []tools.Tool, language tools.ProgramLanguage) (tools.Tool, string, error) {
+func AdaptToolsToPTC(runtime *Runtime, ptcTools []tools.Tool, language tools.ProgramLanguage) (tools.Tool, string, error) {
 	switch language {
 	case tools.JavaScript:
-		return adaptToolsToJSPTC(ptcTools)
+		return adaptToolsToJSPTC(runtime, ptcTools)
 	case tools.Python:
 		return tools.Tool{}, "", fmt.Errorf("ptc python not implemented")
 	case tools.Go:
 		return tools.Tool{}, "", fmt.Errorf("ptc go not implemented")
+	case tools.Lua:
+		return tools.Tool{}, "", fmt.Errorf("ptc lua not implemented")
 	default: // default to JS
-		return adaptToolsToJSPTC(ptcTools)
+		return adaptToolsToJSPTC(runtime, ptcTools)
 	}
-
 }

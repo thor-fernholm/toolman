@@ -1,4 +1,4 @@
-package bfcl
+package main
 
 import (
 	"bytes"
@@ -42,6 +42,7 @@ type Session struct {
 }
 
 type LogEntry struct {
+	Endpoint       string      `json:"endpoint"` // Add this field: "BFCL" or "CFB"
 	ID             int         `json:"id"`
 	Timestamp      string      `json:"timestamp"`
 	RequestJSON    interface{} `json:"request_json"`
@@ -94,9 +95,7 @@ func HandleDebugClear(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// --- MIDDLEWARE (Wraps your Benchmark Handler) ---
-
-func MiddlewareDebugLogger(next http.HandlerFunc) http.HandlerFunc {
+func MiddlewareDebugLogger(endpointName string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -108,69 +107,112 @@ func MiddlewareDebugLogger(next http.HandlerFunc) http.HandlerFunc {
 		next(rw, r)
 
 		go func() {
-			// 1. Unmarshal Request
+			// Unmarshal Request (Generic map)
 			var reqMap map[string]interface{}
 			_ = json.Unmarshal(bodyBytes, &reqMap)
 
-			// 2. Unmarshal Response (Strongly Typed for Tokens/History)
-			type PartialResponse struct {
-				ToolCalls interface{} `json:"tool_calls"`
-				// We don't need History here for the session logic anymore
-				History      []prompt.Prompt `json:"toolman_history"` // <--- KEY FIX
-				InputTokens  int             `json:"input_tokens"`
-				OutputTokens int             `json:"output_tokens"`
+			// Prepare Unified Log Data
+			var (
+				inputTokens, outputTokens int
+				extractedTools            interface{}
+				rawContent                []string
+				responseMap               map[string]interface{} // For full payload view
+			)
+
+			// Unmarshal generic response for the "Full Response" UI view
+			_ = json.Unmarshal(rw.body.Bytes(), &responseMap)
+
+			// Switch Logic based on Endpoint
+			if endpointName == "CFB" {
+				// --- HANDLE OPENAI FORMAT (CFB) ---
+				type CfbCompletion struct {
+					Choices []struct {
+						Message struct {
+							Content   string      `json:"content"`
+							ToolCalls interface{} `json:"tool_calls"`
+						} `json:"message"`
+					} `json:"choices"`
+					Usage struct {
+						PromptTokens     int `json:"prompt_tokens"`
+						CompletionTokens int `json:"completion_tokens"`
+					} `json:"usage"`
+				}
+				type CfbResponse struct {
+					Completion     CfbCompletion   `json:"completion"`
+					ToolmanHistory []prompt.Prompt `json:"toolman_history"`
+					ToolmanCalls   []prompt.Prompt `json:"toolman_calls"`
+				}
+				var resp CfbResponse
+				_ = json.Unmarshal(rw.body.Bytes(), &resp)
+
+				inputTokens = resp.Completion.Usage.PromptTokens
+				outputTokens = resp.Completion.Usage.CompletionTokens
+				rawContent = extractLLMContent(resp.ToolmanHistory)
+
+				if len(resp.Completion.Choices) > 0 {
+					extractedTools = resp.Completion.Choices[0].Message.ToolCalls
+				}
+
+			} else {
+				// --- HANDLE BFCL FORMAT (DEFAULT) ---
+				type BfclResponse struct {
+					ToolCalls    interface{}     `json:"tool_calls"`
+					History      []prompt.Prompt `json:"toolman_history"`
+					InputTokens  int             `json:"input_tokens"`
+					OutputTokens int             `json:"output_tokens"`
+				}
+				var resp BfclResponse
+				_ = json.Unmarshal(rw.body.Bytes(), &resp)
+
+				inputTokens = resp.InputTokens
+				outputTokens = resp.OutputTokens
+				extractedTools = resp.ToolCalls
+				rawContent = extractLLMContent(resp.History)
 			}
-			var respStruct PartialResponse
-			_ = json.Unmarshal(rw.body.Bytes(), &respStruct)
 
-			// Full Response Map for UI
-			var respMap map[string]interface{}
-			_ = json.Unmarshal(rw.body.Bytes(), &respMap)
-
-			atomic.AddUint64(&Store.GlobalInputTokens, uint64(respStruct.InputTokens))
-			atomic.AddUint64(&Store.GlobalOutputTokens, uint64(respStruct.OutputTokens))
+			// Update Global Stats
+			atomic.AddUint64(&Store.GlobalInputTokens, uint64(inputTokens))
+			atomic.AddUint64(&Store.GlobalOutputTokens, uint64(outputTokens))
 
 			Store.Lock()
 			defer Store.Unlock()
 
-			// --- FIX STARTS HERE ---
-
-			// 1. Check the INCOMING request history (from reqMap), not the outgoing response.
-			// BFCL sends empty/nil history at the start of a test case.
+			// Session Management (Heuristic: New session if no history or first msg)
 			reqHist, _ := reqMap["toolman_history"].([]interface{})
-
-			// 2. Check Messages length (New test usually has just 1 user message)
 			msgs, _ := reqMap["messages"].([]interface{})
 
-			// CRITICAL: If incoming history is empty, IT IS A NEW SESSION.
-			isNewSession := (len(reqHist) == 0)
+			// CFB doesn't use toolman_history in request, so we check messages length
+			isNewSession := false
+			if endpointName == "CFB" {
+				// A rough heuristic for CFB: simple user query usually starts a test
+				isNewSession = (len(msgs) == 1)
+			} else {
+				// BFCL heuristic
+				isNewSession = (len(reqHist) == 0)
+			}
 
-			// Fallback heuristic: If history is missing but we have messages,
-			// ensure we don't accidentally merge if BFCL behaves weirdly.
 			if Store.CurrentSess == nil || isNewSession {
 				newSess := &Session{
-					ID:        fmt.Sprintf("Test Case #%d", len(Store.Sessions)+1),
+					ID:        fmt.Sprintf("[%s] Test #%d", endpointName, len(Store.Sessions)+1),
 					StartTime: time.Now().Format("15:04:05"),
 					Requests:  make([]*LogEntry, 0),
 				}
 				Store.Sessions = append(Store.Sessions, newSess)
 				Store.CurrentSess = newSess
 			}
-			// --- FIX ENDS HERE ---
 
-			// Helper to parse the response history for the UI snippet
-			rawContent := extractLLMContent(respStruct.History)
-
+			// Create Entry
 			entry := &LogEntry{
+				Endpoint:       endpointName,
 				ID:             len(Store.CurrentSess.Requests) + 1,
 				Timestamp:      time.Now().Format("15:04:05.000"),
 				RequestJSON:    reqMap,
-				ResponseJSON:   respMap,
-				UserQuery:      extractUserQuery(msgs),
+				ResponseJSON:   responseMap,
+				UserQuery:      extractUserQuery(msgs), // This works for both as both use "messages"
 				LLMRawContent:  rawContent,
-				ExtractedTools: respStruct.ToolCalls,
-				InputTokens:    respStruct.InputTokens,
-				OutputTokens:   respStruct.OutputTokens,
+				ExtractedTools: extractedTools,
+				InputTokens:    inputTokens,
+				OutputTokens:   outputTokens,
 				Duration:       time.Since(start).String(),
 			}
 			Store.CurrentSess.Requests = append(Store.CurrentSess.Requests, entry)
@@ -178,7 +220,6 @@ func MiddlewareDebugLogger(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// THIS IS THE ORIGINAL WORKING LOGIC
 func extractLLMContent(hist []prompt.Prompt) []string {
 	if len(hist) == 0 {
 		fmt.Printf("[debug] no hist")

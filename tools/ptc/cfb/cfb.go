@@ -1,10 +1,12 @@
-package bfcl
+package cfb
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -22,29 +24,77 @@ import (
 )
 
 type BenchmarkRequest struct {
-	Model          string          `json:"bellman_model"`
-	Messages       []Message       `json:"messages"`
-	ToolmanHistory []prompt.Prompt `json:"toolman_history"`
-	Tools          []interface{}   `json:"tools"`
-	Temperature    float64         `json:"temperature"`
-	SystemPrompt   string          `json:"system_prompt"`
+	Model       string        `json:"model"`
+	Messages    []Message     `json:"messages"`
+	Tools       []interface{} `json:"tools"`
+	Temperature float64       `json:"temperature"`
+	//SystemPrompt   string          `json:"system_prompt"`
+	//ToolChoice string `json:"tool_choice"`
+	MaxTokens      int             `json:"max_tokens"`
 	EnablePTC      bool            `json:"enable_ptc"`
+	ToolmanHistory []prompt.Prompt `json:"toolman_history"`
+	ToolmanCalls   []prompt.Prompt `json:"toolman_calls"`
 }
 
 type Message struct {
-	Role     string `json:"role"`
-	Content  string `json:"content"`
-	ToolName string `json:"tool_name"`
-	ToolID   string `json:"tool_call_id"`
+	Role      string     `json:"role"`
+	Content   string     `json:"content"`
+	ToolCalls []ToolCall `json:"tool_calls"`
+	ToolName  string     `json:"tool_name"`
+	ToolID    string     `json:"tool_call_id"`
 }
 
 type BenchmarkResponse struct {
-	ToolCalls      []ExtractedCall `json:"tool_calls"`
-	ToolCallIDs    []string        `json:"tool_call_ids"`
-	ToolmanHistory []prompt.Prompt `json:"toolman_history"`
-	Content        string          `json:"content"`       // Any thought/text
-	InputTokens    int             `json:"input_tokens"`  // Added for tracking
-	OutputTokens   int             `json:"output_tokens"` // Added for tracking
+	Completion     ChatCompletionResponse `json:"completion"`
+	ToolmanHistory []prompt.Prompt        `json:"toolman_history"`
+	ToolmanCalls   []prompt.Prompt        `json:"toolman_calls"`
+}
+
+type ChatCompletionResponse struct {
+	ID      string   `json:"id"`
+	Object  string   `json:"object"`
+	Created int64    `json:"created"`
+	Model   string   `json:"model"`
+	Choices []Choice `json:"choices"`
+	Usage   Usage    `json:"usage"`
+}
+
+type Choice struct {
+	Index        int             `json:"index"`
+	Message      ResponseMessage `json:"message"`
+	FinishReason string          `json:"finish_reason"`
+}
+
+type ResponseMessage struct {
+	Role      string     `json:"role"`
+	Content   string     `json:"content"` // Nullable in JSON, empty string in Go
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+}
+
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function ToolCallFunction `json:"function"`
+}
+
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"` // Vital: This is a stringified JSON blob
+}
+
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+// ExtractedCall: The structure of a single tool call found during execution
+type ExtractedCall map[string]map[string]interface{}
+
+// ExecutionResult holds both the calls found and the final return value of the script
+type ExecutionResult struct {
+	Calls []ToolCall `json:"tool_calls"`
+	Error error      `json:"error"`
 }
 
 var (
@@ -52,7 +102,7 @@ var (
 	GlobalOutputTokens uint64
 )
 
-func HandleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
+func HandleGenerateCFB(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -68,7 +118,7 @@ func HandleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 
 	bellmanUrl := os.Getenv("BELLMAN_URL")
 	bellmanToken := os.Getenv("BELLMAN_TOKEN")
-	client := bellman.New(bellmanUrl, bellman.Key{Name: "bfcl", Token: bellmanToken})
+	client := bellman.New(bellmanUrl, bellman.Key{Name: "cfb", Token: bellmanToken})
 
 	bfclTools := ParseJsonSchemaTools(req.Tools, req.EnablePTC)
 
@@ -103,7 +153,7 @@ func HandleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 			// find all corresponding tool results and concatenate
 			var concatenatedReturns []string
 			for j := 0; j < len(req.Messages); j++ {
-				if req.Messages[j].Role == "tool_response" && req.Messages[j].ToolID == p.ToolCall.ToolCallID {
+				if req.Messages[j].Role == "tool" && req.Messages[j].ToolID == p.ToolCall.ToolCallID {
 					concatenatedReturns = append(concatenatedReturns, fmt.Sprintf("Function '%s' result: %s.", req.Messages[j].ToolName, req.Messages[j].Content))
 				}
 			}
@@ -128,17 +178,19 @@ func HandleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 	}
 	//model = openai.GenModel_gpt4_1_mini_250414
 
-	// remove bfcl prompt for PTC - misleading!
+	// set variable warning; cant inject tool response into goja var
+	systemPrompt := ""
 	if req.EnablePTC { // TODO: this seems dumb, but need to rewrite system prompt otherwise...
-		req.SystemPrompt = "WARNING: You are running a benchmark, which means tool function outputs are NOT assigned to variables. " +
+		systemPrompt = "WARNING: You are running a benchmark, which means tool function outputs are NOT assigned to variables. " +
 			"You must assume that variables can be reset between turns without warning. " +
 			"If you receive new information from a tool function call, you MUST set the variable in the top of the script to make sure you are able to use it." +
 			"This means you need to disregard any variable statements or assumptions listed below."
 	}
 
 	llm := client.Generator().Model(model).
-		System(req.SystemPrompt).
+		System(""). // TODO: check if system prompt available?
 		SetTools(bfclTools...).
+		System(systemPrompt).
 		SetPTCLanguage(tools.JavaScript).
 		Temperature(req.Temperature)
 
@@ -163,22 +215,70 @@ func HandleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 		atomic.LoadUint64(&GlobalInputTokens), atomic.LoadUint64(&GlobalOutputTokens))
 
 	// extract individual new tool calls for bfcl + toolman
-	extractedCalls, toolmanCalls, toolCallIDs, err := GetToolCalls(res, bfclTools)
+	extractedCalls, toolmanCalls, err := GetToolCalls(res, bfclTools)
+
+	if err != nil {
+		log.Fatalf("error: %e", err)
+	}
 
 	// add new toolman calls to conversation history
-	toolmanHistory = append(rebuiltHistory, toolmanCalls...)
+	toolmanHistory = append(toolmanHistory, toolmanCalls...)
+
+	content := ""
+	if res.IsText() {
+		if content, err = res.AsText(); err != nil {
+			log.Printf("error: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	finishReason := "stop"
+	if res.IsTools() {
+		finishReason = "tool_calls"
+	}
+
+	completion := ChatCompletionResponse{
+		ID:      "chatcmpl-123", // Important: fill with mock data! (for completion parsing in cfb)
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   model.String(),
+		Choices: []Choice{{
+			Index: 0,
+			Message: ResponseMessage{
+				Role:      "assistant",
+				Content:   content,
+				ToolCalls: extractedCalls,
+			},
+			FinishReason: finishReason,
+		},
+		},
+		Usage: Usage{
+			PromptTokens:     inputTokens,
+			CompletionTokens: outputTokens,
+			TotalTokens:      inputTokens + outputTokens,
+		},
+	}
 
 	resp := BenchmarkResponse{
-		ToolCalls:      extractedCalls,
-		ToolCallIDs:    toolCallIDs,
+		Completion:     completion,
 		ToolmanHistory: toolmanHistory,
-		Content:        "Tool calls generated", // TODO <-- is this used in bfcl?
-		InputTokens:    res.Metadata.InputTokens,
-		OutputTokens:   res.Metadata.OutputTokens,
+		ToolmanCalls:   toolmanCalls,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func PrintRequest(r *http.Request) {
+	bodyBytes, _ := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	var prettyJSON bytes.Buffer
+	if err := json.Indent(&prettyJSON, bodyBytes, "", "  "); err != nil {
+		fmt.Printf("Received Raw Body: %s\n", string(bodyBytes))
+	} else {
+		fmt.Printf("Received Pretty JSON:\n%s\n", prettyJSON.String())
+	}
 }
 
 // Regex to find invalid characters (only letters, numbers, underscores, dashes allowed)
@@ -194,10 +294,9 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 			Name        string          `json:"name"`
 			Description string          `json:"description"`
 			Parameters  json.RawMessage `json:"parameters"`
-			Response    json.RawMessage `json:"response"`
 		}
 
-		// Handle BFCL's nested "function" wrapper if present
+		// Handle CFB's nested "function" wrapper if present
 		var wrapper struct {
 			Function json.RawMessage `json:"function"`
 		}
@@ -211,15 +310,48 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 			continue
 		}
 
-		//fmt.Printf("tool (%v) desc: %s", i, tDef.Description)
-
 		// OpenAI rejects dots. "math.factorial" -> "math_factorial"
 		sanitizedName := invalidNameChars.ReplaceAllString(tDef.Name, "_")
 
-		paramSchema := parseSchemaRawToJSON(tDef.Parameters)
-		responseSchema := parseSchemaRawToJSON(tDef.Response)
-		normalizeBFCLSchema(&paramSchema, false)
-		normalizeBFCLSchema(&responseSchema, true)
+		// "dict" -> "object"
+		var paramSchema schema.JSON
+
+		if len(tDef.Parameters) > 0 {
+			var check map[string]interface{}
+			if err := json.Unmarshal(tDef.Parameters, &check); err == nil {
+
+				typeVal, _ := check["type"].(string)
+
+				// BFCL uses "dict", OpenAI wants "object"
+				if typeVal == "dict" {
+					check["type"] = "object"
+					typeVal = "object" // Update for the check below
+				}
+
+				// If type is NOT object (e.g. "string"), must wrap it
+				if typeVal != "" && typeVal != "object" {
+					wrapped := map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"arg": check, // Wrap original schema
+						},
+						"required": []string{"arg"},
+					}
+					fixedBytes, _ := json.Marshal(wrapped)
+					_ = json.Unmarshal(fixedBytes, &paramSchema)
+				} else {
+					// It's a valid object/dict, but we might have modified "type" in check
+					// So we marshal 'check' back, not 'tDef.Parameters'
+					fixedBytes, _ := json.Marshal(check)
+					_ = json.Unmarshal(fixedBytes, &paramSchema)
+				}
+			}
+		} else {
+			// Handle empty parameters
+			emptyObj := map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
+			b, _ := json.Marshal(emptyObj)
+			_ = json.Unmarshal(b, &paramSchema)
+		}
 
 		tool := tools.NewTool(sanitizedName,
 			tools.WithDescription(tDef.Description),
@@ -230,7 +362,7 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 		)
 
 		tool.ArgumentSchema = &paramSchema
-		//tool.ResponseSchema = &responseSchema // Important: cant use since we cant inject real response from BFCL!!!!!!
+		//tool.ResponseSchema = &responseSchema // Important: cant use since we cant inject real response from CFB!!!!!!
 
 		parsedTools = append(parsedTools, tool)
 	}
@@ -238,95 +370,12 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 	return parsedTools
 }
 
-func parseSchemaRawToJSON(Parameters json.RawMessage) schema.JSON {
-	// "dict" -> "object"
-	var paramSchema schema.JSON
-
-	if len(Parameters) > 0 {
-		var check map[string]interface{}
-		if err := json.Unmarshal(Parameters, &check); err == nil {
-
-			typeVal, _ := check["type"].(string)
-
-			// BFCL uses "dict", OpenAI wants "object"
-			if typeVal == "dict" {
-				check["type"] = "object"
-				typeVal = "object" // Update for the check below
-			}
-
-			// If type is NOT object (e.g. "string"), must wrap it
-			if typeVal != "" && typeVal != "object" {
-				wrapped := map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"arg": check, // Wrap original schema
-					},
-					"required": []string{"arg"},
-				}
-				fixedBytes, _ := json.Marshal(wrapped)
-				_ = json.Unmarshal(fixedBytes, &paramSchema)
-			} else {
-				// It's a valid object/dict, but we might have modified "type" in check
-				// So we marshal 'check' back, not 'tDef.Parameters'
-				fixedBytes, _ := json.Marshal(check)
-				_ = json.Unmarshal(fixedBytes, &paramSchema)
-			}
-		}
-	} else {
-		// Handle empty parameters
-		emptyObj := map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
-		b, _ := json.Marshal(emptyObj)
-		_ = json.Unmarshal(b, &paramSchema)
-	}
-
-	return paramSchema
-}
-
-// normalizeBFCLSchema recursively cleans non-standard types from BFCL datasets
-func normalizeBFCLSchema(s *schema.JSON, req bool) { // Replace *schema.JSON with your actual struct type if different
-	if s == nil {
-		return
-	}
-
-	// 1. Fix the Pythonic/BFCL type dialects
-	switch s.Type {
-	case "dict":
-		s.Type = "object"
-	case "list":
-		s.Type = "array"
-	case "int":
-		s.Type = "integer"
-	case "float":
-		s.Type = "number"
-	case "bool":
-		s.Type = "boolean"
-	}
-
-	// if response --> set all fields to required
-	if req && s.Type == "object" && len(s.Properties) > 0 && len(s.Required) == 0 {
-		for key := range s.Properties {
-			s.Required = append(s.Required, key)
-		}
-	}
-
-	// Recursively traverse and fix nested properties (for objects)
-	for _, prop := range s.Properties {
-		normalizeBFCLSchema(prop, req)
-	}
-
-	// Recursively traverse and fix array items (for lists/arrays)
-	if s.Items != nil {
-		normalizeBFCLSchema(s.Items, req)
-	}
-}
-
 // GetToolCalls extracts calls in the Ground Truth format: [{"func": {"arg": val}}]
-func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCall, []prompt.Prompt, []string, error) {
-	// BFCL
-	var calls []ExtractedCall
+func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ToolCall, []prompt.Prompt, error) {
+	// CFB
+	var calls []ToolCall
 	// Toolman
 	var toolCalls []prompt.Prompt
-	var toolIDs []string
 
 	if !res.IsTools() { // --> res.IsText()
 		text, err := res.AsText()
@@ -334,10 +383,10 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCa
 			log.Fatalf("error: %e", err)
 		}
 		assistant := []prompt.Prompt{prompt.AsAssistant(text)}
-		return calls, assistant, toolIDs, nil
+		return calls, assistant, nil
 	}
 
-	for i, tool := range res.Tools {
+	for _, tool := range res.Tools {
 		// --- PTC / Code Execution ---
 		if tool.Name == "code_execution" {
 			var codeArgs struct {
@@ -347,13 +396,11 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCa
 			if err := json.Unmarshal(tool.Argument, &codeArgs); err == nil {
 				// Run the Extractor
 				execResult := ExecuteAndExtract(codeArgs.Code, availableTools)
-				// Append all calls found in the JS code
-				calls = append(calls, execResult.Calls...)
-
-				// add ID for each bfcl tool call
-				for range execResult.Calls {
-					toolIDs = append(toolIDs, tool.ID)
+				// Append all calls found in the JS code (with correct ID)
+				for _, c := range execResult.Calls {
+					c.ID = tool.ID
 				}
+				calls = append(calls, execResult.Calls...)
 
 				// add toolman call + ID & check for JS execution errors!
 				toolCalls = append(toolCalls, prompt.AsToolCall(tool.ID, tool.Name, tool.Argument))
@@ -378,27 +425,21 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ExtractedCa
 			argsMap = make(map[string]interface{})
 		}
 
-		fmt.Printf("Tool call %v: name: %v, args: %v\n", i, tool.Name, tool.Argument)
 		toolCalls = append(toolCalls, prompt.AsToolCall(tool.ID, tool.Name, tool.Argument))
-		toolIDs = append(toolIDs, tool.ID)
 
 		// Construct the entry
-		entry := ExtractedCall{
-			tool.Name: argsMap,
+		entry := ToolCall{
+			ID:   tool.ID,
+			Type: "function",
+			Function: ToolCallFunction{
+				Name:      tool.Name,
+				Arguments: string(tool.Argument),
+			},
 		}
 		calls = append(calls, entry)
 	}
 
-	return calls, toolCalls, toolIDs, nil
-}
-
-// ExtractedCall: The structure of a single tool call found during execution
-type ExtractedCall map[string]map[string]interface{}
-
-// ExecutionResult holds both the calls found and the final return value of the script
-type ExecutionResult struct {
-	Calls []ExtractedCall `json:"tool_calls"`
-	Error error           `json:"error"`
+	return calls, toolCalls, nil
 }
 
 func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionResult {
@@ -410,11 +451,11 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionRes
 	}()
 
 	vm := goja.New()
-	var capturedCalls []ExtractedCall
+	var capturedCalls []ToolCall
 
 	// TIMEOUT SAFETY: Prevent infinite loops (e.g. while(true))
 	// Interrupt execution after 500ms.
-	timer := time.AfterFunc(5000*time.Millisecond, func() {
+	timer := time.AfterFunc(500*time.Millisecond, func() {
 		vm.Interrupt("timeout")
 	})
 	defer timer.Stop()
@@ -436,32 +477,47 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionRes
 		// INTERCEPTOR: Runs when JS calls a tool
 		interceptor := func(call goja.FunctionCall) goja.Value {
 			argsMap := make(map[string]interface{})
-			// ROBUST ARG PARSING: Handle any argument style
+
+			// ROBUST ARG PARSING
 			if len(call.Arguments) > 0 {
+				// Export() converts goja.Value to Go interface{}
 				firstArg := call.Arguments[0].Export()
 
-				// Scenario A: Standard BFCL (First arg is a Dictionary)
-				// tool({ "arg": 1 })
+				// Scenario A: Standard (First arg is a Dictionary/Object)
 				if obj, ok := firstArg.(map[string]interface{}); ok {
 					for k, v := range obj {
 						argsMap[k] = v
 					}
 				} else {
-					// Scenario B: Hallucinated Positional Args
-					// tool("value", 123)
-					// We capture them with generic keys so we don't lose data.
+					// Scenario B: Positional Args or Non-Object
+					// We capture them with generic keys
 					argsMap["__arg_0__"] = firstArg
-					for i := 1; i < len(call.Arguments); i++ {
-						fmt.Printf("[Fix] caught a previous js extract error...")
-						key := fmt.Sprintf("__arg_%d__", i)
-						argsMap[key] = call.Arguments[i].Export()
-					}
+				}
+
+				// Capture remaining positional arguments if any
+				for i := 1; i < len(call.Arguments); i++ {
+					key := fmt.Sprintf("__arg_%d__", i)
+					argsMap[key] = call.Arguments[i].Export()
 				}
 			}
 
+			// parse json into string
+			argsBytes, err := json.Marshal(argsMap)
+			argsStr := "{}"
+			if err == nil {
+				argsStr = string(argsBytes)
+			} else {
+				fmt.Printf("[Warning] Failed to marshal args for %s: %v\n", tName, err)
+			}
+
 			// Record the call
-			capturedCalls = append(capturedCalls, ExtractedCall{
-				tName: argsMap,
+			capturedCalls = append(capturedCalls, ToolCall{
+				ID:   "", // should be replaced later
+				Type: "function",
+				Function: ToolCallFunction{
+					Name:      tName,
+					Arguments: argsStr,
+				},
 			})
 
 			// Return generic mock to keep script running
@@ -489,6 +545,8 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionRes
 			fmt.Printf("[warning] JS Runtime Error: %v\n", err)
 		}
 	}
+
+	//fmt.Printf("________ Code:\n%v\n", jsCode)
 
 	return &ExecutionResult{
 		Calls: capturedCalls,
