@@ -116,10 +116,6 @@ func HandleGenerateCFB(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(req.Messages) > 1 {
-		log.Printf("------received multiple messages: %v\n", req.Messages)
-	}
-
 	bellmanUrl := os.Getenv("BELLMAN_URL")
 	bellmanToken := os.Getenv("BELLMAN_TOKEN")
 	client := bellman.New(bellmanUrl, bellman.Key{Name: "cfb", Token: bellmanToken})
@@ -176,19 +172,25 @@ func HandleGenerateCFB(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if len(req.Messages) > 1 {
-		log.Printf("------rebuilt toolman history: %v\n", rebuiltHistory)
-	}
-
 	model, err := gen.ToModel(req.Model)
 	if err != nil {
 		log.Fatalf("error: %e", err)
 	}
 	//model = openai.GenModel_gpt4_1_mini_250414
 
+	// set variable warning; cant inject tool response into goja var
+	systemPrompt := ""
+	if req.EnablePTC { // TODO: this seems dumb, but need to rewrite system prompt otherwise...
+		systemPrompt = "WARNING: You are running a benchmark, which means tool function outputs are NOT assigned to variables. " +
+			"You must assume that variables can be reset between turns without warning. " +
+			"If you receive new information from a tool function call, you MUST set the variable in the top of the script to make sure you are able to use it." +
+			"This means you need to disregard any variable statements or assumptions listed below."
+	}
+
 	llm := client.Generator().Model(model).
 		System(""). // TODO: check if system prompt available?
 		SetTools(bfclTools...).
+		System(systemPrompt).
 		SetPTCLanguage(tools.JavaScript).
 		Temperature(req.Temperature)
 
@@ -308,8 +310,6 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 			continue
 		}
 
-		//fmt.Printf("tool (%v) desc: %s", i, tDef.Description)
-
 		// OpenAI rejects dots. "math.factorial" -> "math_factorial"
 		sanitizedName := invalidNameChars.ReplaceAllString(tDef.Name, "_")
 
@@ -362,17 +362,9 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 		)
 
 		tool.ArgumentSchema = &paramSchema
-		parsedTools = append(parsedTools, tool)
-	}
+		//tool.ResponseSchema = &responseSchema // Important: cant use since we cant inject real response from CFB!!!!!!
 
-	// Marshal with indentation (prefix="", indent="  ")
-	prettyJSON, err := json.MarshalIndent(rawTools[0], "", "  ")
-	prettyJSON2, err2 := json.MarshalIndent(parsedTools[0], "", "  ")
-	if err != nil || err2 != nil {
-		fmt.Printf("Failed to marshal args: %v", err)
-	} else {
-		fmt.Printf("First raw tool:\n%s", string(prettyJSON))
-		fmt.Printf("First toolman tool:\n%s", string(prettyJSON2))
+		parsedTools = append(parsedTools, tool)
 	}
 
 	return parsedTools
@@ -384,7 +376,6 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ToolCall, [
 	var calls []ToolCall
 	// Toolman
 	var toolCalls []prompt.Prompt
-	//var toolIDs []string
 
 	if !res.IsTools() { // --> res.IsText()
 		text, err := res.AsText()
@@ -395,7 +386,7 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ToolCall, [
 		return calls, assistant, nil
 	}
 
-	for i, tool := range res.Tools {
+	for _, tool := range res.Tools {
 		// --- PTC / Code Execution ---
 		if tool.Name == "code_execution" {
 			var codeArgs struct {
@@ -434,9 +425,7 @@ func GetToolCalls(res *gen.Response, availableTools []tools.Tool) ([]ToolCall, [
 			argsMap = make(map[string]interface{})
 		}
 
-		fmt.Printf("Tool call %v: name: %v, args: %v\n", i, tool.Name, tool.Argument)
 		toolCalls = append(toolCalls, prompt.AsToolCall(tool.ID, tool.Name, tool.Argument))
-		//toolIDs = append(toolIDs, tool.ID)
 
 		// Construct the entry
 		entry := ToolCall{
@@ -557,7 +546,7 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionRes
 		}
 	}
 
-	fmt.Printf("________ Code:\n%v\n", jsCode)
+	//fmt.Printf("________ Code:\n%v\n", jsCode)
 
 	return &ExecutionResult{
 		Calls: capturedCalls,

@@ -129,8 +129,11 @@ func HandleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 	//model = openai.GenModel_gpt4_1_mini_250414
 
 	// remove bfcl prompt for PTC - misleading!
-	if req.EnablePTC {
-		req.SystemPrompt = ""
+	if req.EnablePTC { // TODO: this seems dumb, but need to rewrite system prompt otherwise...
+		req.SystemPrompt = "WARNING: You are running a benchmark, which means tool function outputs are NOT assigned to variables. " +
+			"You must assume that variables can be reset between turns without warning. " +
+			"If you receive new information from a tool function call, you MUST set the variable in the top of the script to make sure you are able to use it." +
+			"This means you need to disregard any variable statements or assumptions listed below."
 	}
 
 	llm := client.Generator().Model(model).
@@ -227,7 +230,7 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 		)
 
 		tool.ArgumentSchema = &paramSchema
-		tool.ResponseSchema = &responseSchema
+		//tool.ResponseSchema = &responseSchema // Important: cant use since we cant inject real response from BFCL!!!!!!
 
 		parsedTools = append(parsedTools, tool)
 	}
