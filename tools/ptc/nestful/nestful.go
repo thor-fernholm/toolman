@@ -30,8 +30,8 @@ type NestfulBenchmarkRequest struct {
 	MaxTokens          int     `json:"max_tokens"`
 	SystemPrompt       string  `json:"system_prompt"`
 	EnablePTC          bool    `json:"enable_ptc"`
-	ToolChoice         string  `json:"tool_choice,omitempty"`           // auto|required|none
-	JSExtractTimeoutMs int     `json:"js_extract_timeout_ms,omitempty"` // default 500
+	ToolChoice         string  `json:"tool_choice,omitempty"` // auto|required|none
+	JSExtractTimeoutMs int     `json:"js_extract_timeout_ms,omitempty"`
 }
 
 type NestfulBenchmarkResponse struct {
@@ -43,9 +43,10 @@ type NestfulBenchmarkResponse struct {
 }
 
 type nestfulToolDef struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters"`
+	Name             string         `json:"name"`
+	Description      string         `json:"description"`
+	Parameters       map[string]any `json:"parameters"`
+	OutputParameters map[string]any `json:"output_parameters"`
 }
 
 // Regex to find invalid tool-name characters.
@@ -59,115 +60,118 @@ func NesfulHandlerFromEnv() http.HandlerFunc {
 	model := "OpenAI/gpt-4o-mini"
 	defaultModelFQN := os.Getenv(model)
 
-	return NewNestfulHandler(client, defaultModelFQN)
+	return NestfulHandlerWrapper(client, defaultModelFQN)
 }
 
-// NewNestfulHandler exposes a single-shot endpoint that returns predicted tool-call sequences in NESTFUL's format.
+// NestfulHandler exposes a single-shot endpoint that returns predicted tool-call sequences in NESTFUL's format.
 //
 // - If EnablePTC=false: reads res.Tools and returns [{name,arguments,label}, ...]
 // - If EnablePTC=true: expects code_execution; runs JS in goja with interceptors and returns the extracted sequence.
 //
 // Tools are never executed.
-func NewNestfulHandler(client *bellman.Bellman, defaultModelFQN string) http.HandlerFunc {
+
+func NestfulHandler(w http.ResponseWriter, r *http.Request, client *bellman.Bellman, defaultModelFQN string) {
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req NestfulBenchmarkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpErr(w, fmt.Errorf("invalid json: %w", err), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Query) == "" {
+		httpErr(w, fmt.Errorf("query is required"), http.StatusBadRequest)
+		return
+	}
+	if req.MaxTokens <= 0 {
+		req.MaxTokens = 1000
+	}
+	if req.JSExtractTimeoutMs <= 0 {
+		req.JSExtractTimeoutMs = 5000
+	}
+	choice := strings.ToLower(strings.TrimSpace(req.ToolChoice))
+	if choice == "" {
+		choice = "required"
+	}
+
 	if strings.TrimSpace(defaultModelFQN) == "" {
 		defaultModelFQN = "OpenAI/gpt-4o-mini"
 	}
+	model, err := parseModelFQN(defaultModelFQN)
+	if err != nil {
+		httpErr(w, fmt.Errorf("invalid model: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	parsedTools, nameMap, outKeysByTool, err := parseNestfulTools(req.Tools)
+	if err != nil {
+		httpErr(w, fmt.Errorf("invalid tools: %w", err), http.StatusBadRequest)
+		return
+	}
+	for i := range parsedTools {
+		parsedTools[i].UsePTC = req.EnablePTC
+		// Never executed; just to keep tool refs non-nil.
+		parsedTools[i].Function = func(ctx context.Context, call tools.Call) (string, error) { return "{}", nil }
+	}
+	llm := client.Generator().
+		Model(model).
+		System(req.SystemPrompt).
+		SetTools(parsedTools...).
+		SetPTCLanguage(tools.JavaScript).
+		Temperature(req.Temperature).
+		MaxTokens(req.MaxTokens)
+
+	switch choice {
+	case "required":
+		llm = llm.SetToolConfig(tools.RequiredTool)
+	case "auto":
+		llm = llm.SetToolConfig(tools.AutoTool)
+	case "none":
+		llm = llm.SetToolConfig(tools.NoTool)
+	default:
+		httpErr(w, fmt.Errorf("invalid tool_choice: %q", req.ToolChoice), http.StatusBadRequest)
+		return
+	}
+
+	res, err := llm.Prompt(prompt.AsUser(req.Query))
+	println("LMM resp", res, err)
+	if err != nil {
+		httpErr(w, fmt.Errorf("upstream error: %w", err), http.StatusBadGateway)
+		return
+	}
+
+	generated, content := nestfulGeneratedText(res, parsedTools, nameMap, outKeysByTool, req.JSExtractTimeoutMs)
+	writeJSON(w, http.StatusOK, NestfulBenchmarkResponse{
+		GeneratedText: generated,
+		Content:       content,
+		InputTokens:   res.Metadata.InputTokens,
+		OutputTokens:  res.Metadata.OutputTokens,
+		TotalTokens:   res.Metadata.TotalTokens,
+	})
+}
+
+func NestfulHandlerWrapper(client *bellman.Bellman, defaultModelFQN string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var req NestfulBenchmarkRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			httpErr(w, fmt.Errorf("invalid json: %w", err), http.StatusBadRequest)
-			return
-		}
-		if strings.TrimSpace(req.Query) == "" {
-			httpErr(w, fmt.Errorf("query is required"), http.StatusBadRequest)
-			return
-		}
-		if req.MaxTokens <= 0 {
-			req.MaxTokens = 1000
-		}
-		if req.JSExtractTimeoutMs <= 0 {
-			req.JSExtractTimeoutMs = 5000
-		}
-		choice := strings.ToLower(strings.TrimSpace(req.ToolChoice))
-		if choice == "" {
-			choice = "required"
-		}
-
-		modelStr := strings.TrimSpace(req.Model)
-		if modelStr == "" {
-			modelStr = defaultModelFQN
-		}
-		model, err := parseModelFQN(modelStr)
-		if err != nil {
-			httpErr(w, fmt.Errorf("invalid model: %w", err), http.StatusBadRequest)
-			return
-		}
-
-		parsedTools, nameMap, err := parseNestfulTools(req.Tools)
-		if err != nil {
-			httpErr(w, fmt.Errorf("invalid tools: %w", err), http.StatusBadRequest)
-			return
-		}
-		for i := range parsedTools {
-			parsedTools[i].UsePTC = req.EnablePTC
-			// Never executed; just to keep tool refs non-nil.
-			parsedTools[i].Function = func(ctx context.Context, call tools.Call) (string, error) { return "{}", nil }
-		}
-
-		llm := client.Generator().
-			Model(model).
-			System(req.SystemPrompt).
-			SetTools(parsedTools...).
-			SetPTCLanguage(tools.JavaScript).
-			Temperature(req.Temperature).
-			MaxTokens(req.MaxTokens)
-
-		switch choice {
-		case "required":
-			llm = llm.SetToolConfig(tools.RequiredTool)
-		case "auto":
-			llm = llm.SetToolConfig(tools.AutoTool)
-		case "none":
-			llm = llm.SetToolConfig(tools.NoTool)
-		default:
-			httpErr(w, fmt.Errorf("invalid tool_choice: %q", req.ToolChoice), http.StatusBadRequest)
-			return
-		}
-
-		res, err := llm.Prompt(prompt.AsUser(req.Query))
-		println("LMM resp", res, err)
-		if err != nil {
-			httpErr(w, fmt.Errorf("upstream error: %w", err), http.StatusBadGateway)
-			return
-		}
-
-		generated, content := nestfulGeneratedText(res, parsedTools, nameMap, req.JSExtractTimeoutMs)
-		writeJSON(w, http.StatusOK, NestfulBenchmarkResponse{
-			GeneratedText: generated,
-			Content:       content,
-			InputTokens:   res.Metadata.InputTokens,
-			OutputTokens:  res.Metadata.OutputTokens,
-			TotalTokens:   res.Metadata.TotalTokens,
-		})
+		NestfulHandler(w, r, client, defaultModelFQN)
 	}
 }
 
-func parseNestfulTools(raw []any) ([]tools.Tool, map[string]string, error) {
+func parseNestfulTools(raw []any) ([]tools.Tool, map[string]string, map[string][]string, error) {
 	// nameMap: sanitized -> original
 	nameMap := map[string]string{}
+	// outKeysByTool: sanitized tool name -> sorted output keys
+	outKeysByTool := map[string][]string{}
 	parsed := make([]tools.Tool, 0, len(raw))
 	for _, rt := range raw {
 		b, err := json.Marshal(rt)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		var def nestfulToolDef
 		if err := json.Unmarshal(b, &def); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if strings.TrimSpace(def.Name) == "" {
 			continue
@@ -175,6 +179,19 @@ func parseNestfulTools(raw []any) ([]tools.Tool, map[string]string, error) {
 		orig := def.Name
 		sanitized := invalidNameChars.ReplaceAllString(orig, "_")
 		nameMap[sanitized] = orig
+
+		outKeys := make([]string, 0, len(def.OutputParameters))
+		for k := range def.OutputParameters {
+			if strings.TrimSpace(k) == "" {
+				continue
+			}
+			outKeys = append(outKeys, k)
+		}
+		if len(outKeys) == 0 {
+			outKeys = []string{"result"}
+		}
+		sort.Strings(outKeys)
+		outKeysByTool[sanitized] = outKeys
 
 		s := &schema.JSON{Type: schema.Object, Properties: map[string]*schema.JSON{}}
 		var required []string
@@ -203,14 +220,14 @@ func parseNestfulTools(raw []any) ([]tools.Tool, map[string]string, error) {
 
 		parsed = append(parsed, tools.Tool{
 			Name:           sanitized,
-			Description:    def.Description,
+			Description:    strings.TrimSpace(def.Description + "\nOutput keys: " + strings.Join(outKeys, ", ")),
 			ArgumentSchema: s,
 		})
 	}
-	return parsed, nameMap, nil
+	return parsed, nameMap, outKeysByTool, nil
 }
 
-func nestfulGeneratedText(res *gen.Response, availableTools []tools.Tool, nameMap map[string]string, timeoutMs int) (generated string, content string) {
+func nestfulGeneratedText(res *gen.Response, availableTools []tools.Tool, nameMap map[string]string, outKeysByTool map[string][]string, timeoutMs int) (generated string, content string) {
 	if !res.IsTools() {
 		text, _ := res.AsText()
 		return "[]", text
@@ -226,9 +243,16 @@ func nestfulGeneratedText(res *gen.Response, availableTools []tools.Tool, nameMa
 				errMsgs = append(errMsgs, fmt.Sprintf("code_execution args unmarshal error: %v", err))
 				continue
 			}
-			seq, errMsg := executeAndExtractNestful(codeArgs.Code, availableTools, timeoutMs)
+			seq, errMsg := executeAndExtractNestful(codeArgs.Code, availableTools, outKeysByTool, timeoutMs)
 			if errMsg != "" {
 				errMsgs = append(errMsgs, errMsg)
+			}
+			for i := range seq {
+				if n, ok := seq[i]["name"].(string); ok {
+					if orig, ok := nameMap[n]; ok {
+						seq[i]["name"] = orig
+					}
+				}
 			}
 			out = append(out, seq...)
 			continue
@@ -248,7 +272,7 @@ func nestfulGeneratedText(res *gen.Response, availableTools []tools.Tool, nameMa
 	return string(mustJSON(out)), strings.Join(errMsgs, "\n")
 }
 
-func executeAndExtractNestful(jsCode string, availableTools []tools.Tool, timeoutMs int) ([]map[string]any, string) {
+func executeAndExtractNestful(jsCode string, availableTools []tools.Tool, outKeysByTool map[string][]string, timeoutMs int) ([]map[string]any, string) {
 	vm := goja.New()
 	var captured []map[string]any
 
@@ -264,11 +288,18 @@ func executeAndExtractNestful(jsCode string, availableTools []tools.Tool, timeou
 
 	for _, t := range availableTools {
 		tName := t.Name
+		keys := outKeysByTool[tName]
+		if len(keys) == 0 {
+			keys = []string{"result"}
+		}
 		interceptor := func(call goja.FunctionCall) goja.Value {
 			// Reserve the label index for this tool call so the returned placeholder
 			// matches the final label numbering ($var_1, $var_2, ...).
 			idx := len(captured) + 1
-			placeholder := fmt.Sprintf("$var_%d.result$", idx)
+			outObj := make(map[string]any, len(keys))
+			for _, k := range keys {
+				outObj[k] = fmt.Sprintf("$var_%d.%s$", idx, k)
+			}
 
 			argsMap := make(map[string]any)
 			if len(call.Arguments) > 0 {
@@ -278,9 +309,9 @@ func executeAndExtractNestful(jsCode string, availableTools []tools.Tool, timeou
 						argsMap[k] = v
 					}
 				} else {
-					argsMap["__arg_0__"] = first
+					argsMap["arg_0"] = first
 					for i := 1; i < len(call.Arguments); i++ {
-						argsMap[fmt.Sprintf("__arg_%d__", i)] = call.Arguments[i].Export()
+						argsMap[fmt.Sprintf("arg_%d", i)] = call.Arguments[i].Export()
 					}
 				}
 			}
@@ -288,8 +319,8 @@ func executeAndExtractNestful(jsCode string, availableTools []tools.Tool, timeou
 			_ = normalizeVarRefs(argsMap)
 			captured = append(captured, map[string]any{"name": tName, "arguments": argsMap})
 
-			// Return a JS object so the model can use `.result` in subsequent calls.
-			return vm.ToValue(map[string]any{"result": placeholder})
+			// Return a JS object so the model can chain on declared output keys.
+			return vm.ToValue(outObj)
 		}
 		_ = vm.Set(tName, interceptor)
 	}
@@ -308,8 +339,10 @@ func normalizeVarRefs(v any) any {
 	switch x := v.(type) {
 	case map[string]any:
 		if len(x) == 1 {
-			if r, ok := x["result"].(string); ok && strings.HasPrefix(r, "$var_") && strings.HasSuffix(r, ".result$") {
-				return r
+			for _, vv := range x {
+				if r, ok := vv.(string); ok && strings.HasPrefix(r, "$var_") && strings.HasSuffix(r, "$") {
+					return r
+				}
 			}
 		}
 		for k, vv := range x {
