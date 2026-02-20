@@ -3,7 +3,9 @@ package gen
 import (
 	"context"
 	"errors"
+	"log"
 
+	"github.com/dop251/goja"
 	"github.com/modfin/bellman/prompt"
 	"github.com/modfin/bellman/schema"
 	"github.com/modfin/bellman/tools"
@@ -13,6 +15,7 @@ import (
 type Generator struct {
 	Prompter Prompter
 	Request  Request
+	Runtime  *ptc.Runtime
 }
 
 func Float(f float64) *float64 {
@@ -133,28 +136,38 @@ func (b *Generator) SetTools(tool ...tools.Tool) *Generator {
 	bb := b.clone()
 
 	// adapt PTC tools
-	bellmanTools, PTCTools := ptc.ExtractPTCTools(tool)
-	if len(PTCTools) > 0 {
-		unifiedPTCTool, systemFragment, err := ptc.AdaptToolsToPTC(PTCTools, bb.Request.PTCLanguage)
-		if err != nil {
-			// on error; warn and resort to standard tools
-			bellmanTools = append(bellmanTools, PTCTools...)
-			bb.Request.PTCSystemFragment = ""
-		} else {
-			// add PTC tool to bellman tools and set system fragment (for PTC )
-			bellmanTools = append(bellmanTools, unifiedPTCTool)
-			bb.Request.PTCSystemFragment = systemFragment
-		}
-	} else {
-		// if no PTC tools -> set no PTC system fragment
-		bb.Request.PTCSystemFragment = ""
-	}
+	bellmanTools := bb.adaptPTCTools(tool...)
 
 	bb.Request.Tools = append([]tools.Tool{}, bellmanTools...)
 	return bb
 }
 func (b *Generator) AddTools(tool ...tools.Tool) *Generator {
 	return b.SetTools(append(b.Request.Tools, tool...)...)
+}
+
+// adaptPTCTools converts PTC enabled tools to a unified PTC tool, and sets PTC system fragment (PTC usage instructions).
+// This will ensure execution environment session in running.
+func (b *Generator) adaptPTCTools(tool ...tools.Tool) []tools.Tool {
+	bellmanTools, PTCTools := ptc.ExtractPTCTools(tool)
+	if len(PTCTools) > 0 {
+		b.EnsureRuntimeSession() // Make sure runtime session is running, or start one
+
+		unifiedPTCTool, systemFragment, err := ptc.AdaptToolsToPTC(b.Runtime, PTCTools, b.Request.PTCLanguage)
+		if err != nil {
+			// on error; warn and resort to standard Bellman tools
+			log.Printf("Warning: error adapting PTC tools: %v\n", err)
+			bellmanTools = append(bellmanTools, PTCTools...)
+			b.Request.PTCSystemFragment = ""
+		} else {
+			// add PTC tool to bellman tools and set system fragment (for PTC)
+			bellmanTools = append(bellmanTools, unifiedPTCTool)
+			b.Request.PTCSystemFragment = systemFragment
+		}
+	} else {
+		// if no PTC tools -> set empty PTC system fragment
+		b.Request.PTCSystemFragment = ""
+	}
+	return bellmanTools
 }
 
 func (b *Generator) SetToolConfig(tool tools.Tool) *Generator {
@@ -178,6 +191,41 @@ func (b *Generator) SetPTCLanguage(language tools.ProgramLanguage) *Generator {
 	b.SetTools(bb.Request.Tools...)
 
 	return bb
+}
+
+func (b *Generator) EnsureRuntimeSession() *Generator {
+	if b.Runtime == nil {
+		b.Runtime = &ptc.Runtime{}
+	}
+
+	switch b.Request.PTCLanguage {
+	case tools.JavaScript:
+		if b.Runtime.JS == nil {
+			return b.ResetRuntimeSession()
+		}
+	default: // default to JS
+		if b.Runtime.JS == nil {
+			return b.ResetRuntimeSession()
+		}
+	}
+	return b
+}
+
+func (b *Generator) ResetRuntimeSession() *Generator {
+	// lock access to VM
+	b.Runtime.Mutex.Lock()
+	defer b.Runtime.Mutex.Unlock()
+
+	// dereference all vms to garbage collect them
+	b.Runtime.JS = nil
+
+	switch b.Request.PTCLanguage {
+	case tools.JavaScript:
+		b.Runtime.JS = goja.New()
+	default:
+		b.Runtime.JS = goja.New()
+	}
+	return b
 }
 
 func (b *Generator) StopAt(stop ...string) *Generator {

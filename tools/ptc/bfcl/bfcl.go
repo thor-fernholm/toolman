@@ -231,7 +231,7 @@ func ExecuteAndExtract(jsCode string, availableTools []tools.Tool) *ExecutionRes
 
 	// TIMEOUT SAFETY: Prevent infinite loops (e.g. while(true))
 	// Interrupt execution after 500ms.
-	timer := time.AfterFunc(500*time.Millisecond, func() {
+	timer := time.AfterFunc(5000*time.Millisecond, func() {
 		vm.Interrupt("timeout")
 	})
 	defer timer.Stop()

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/dop251/goja"
 	"github.com/modfin/bellman/schema"
@@ -13,30 +14,27 @@ import (
 )
 
 // adaptToolsToJSPTC converts a list of Bellman tools into a single PTC tool with JS execution environment
-func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
+func adaptToolsToJSPTC(runtime *Runtime, inputTools []tools.Tool) (tools.Tool, string, error) {
 	var descriptions []string
-
-	// instantiate goja vm
-	vm := goja.New()
 
 	// register each tool in the VM and build docs
 	for _, t := range inputTools {
-		err := bindToolToJSVM(vm, t)
+		err := bindToolToJSVM(runtime, t)
 		if err != nil {
 			return tools.Tool{}, "", fmt.Errorf("error occurred: %w", err)
 		}
-		// create signature description like: function_name({ argument: type }): description...
+		// create tool/function signature description
 		signature := formatToolSignature(t)
 		descriptions = append(descriptions, signature)
 	}
 
 	// define the schema for the PTC tool itself
 	type CodeArgs struct {
-		Code string `json:"code" json-description:"The executable JavaScript code string."`
+		Code string `json:"code" json-description:"The executable top-level JavaScript code string."`
 	}
 
 	// create the execution function
-	executor := func(ctx context.Context, call tools.Call) (string, error) {
+	executor := func(ctx context.Context, call tools.Call) (resString string, err error) {
 		var arg CodeArgs
 		if err := json.Unmarshal(call.Argument, &arg); err != nil {
 			return "", err
@@ -47,18 +45,48 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 			return err.Error(), nil
 		}
 
-		// execute JS
-		res, err := vm.RunString(code)
+		// panic recovery
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Critical Panic in Goja: %v\n", r)
+				// Return error to the LLM so it can attempt a fix
+				resString = fmt.Sprintf(`{"error": "critical JS panic: %v"}`, r)
+				err = nil // TODO: return error or string to llm?
+			}
+		}()
+
+		// timeout interrupt
+		timer := time.AfterFunc(5*time.Second, func() {
+			runtime.JS.Interrupt("timeout: script execution took too long (possible infinite loop)")
+		})
+		defer timer.Stop()
+
+		//fmt.Printf("________ js code:\n%s\n", code)
+
+		// lock access to VM
+		runtime.Mutex.Lock()
+		defer runtime.Mutex.Unlock()
+
+		// execute JS - Note: vm.RunString returns the value of the LAST evaluated expression automatically!
+		res, err := runtime.JS.RunString(code)
 		if err != nil {
 			// return error as JSON so LLM can see it
-			return fmt.Sprintf(`{"error": %q. Info: Assigned variables persist in JS Environment...}`, err.Error()), nil
+			return fmt.Sprintf(`{"error": %q}`, err.Error()), nil
 		}
 
-		// export result and marshal
-		jsonBytes, err := json.Marshal(res.Export())
-		if err != nil {
-			return "", err
+		// Export result and marshal - If the LLM returned nothing, res is undefined, which marshals to null
+		var jsonBytes []byte
+		if res == nil || goja.IsUndefined(res) {
+			jsonBytes = []byte("null")
+		} else {
+			jsonBytes, err = json.Marshal(res.Export())
+			if err != nil {
+				return "", err
+			}
 		}
+
+		//fmt.Printf("________ Code response:\n%s\n", string(jsonBytes))
+
 		return string(jsonBytes), nil
 	}
 
@@ -67,16 +95,29 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 
 	// create the final PTC tool
 	ptcTool := tools.NewTool("code_execution",
-		tools.WithDescription(
-			"Execute a complete JavaScript program in a minimal Goja runtime.\n"+
-				"The input MUST be a self-contained script wrapped exactly as:\n"+
-				"(function() { ... })()\n\n"+
-				"All task logic and ALL tool calls must be inside this single script.\n"+
-				"Call this tool exactly once per turn.\n\n"+
-				"The script must return one final JSON value.\n"+
-				"No logging, async code, or external APIs are available.\n\n"+
-				"The following tool functions are callable inside the script:\n"+
-				docsFragment,
+		tools.WithDescription(`Execute top-level JavaScript in a persistent Goja runtime to call available Tool Functions.
+
+Use this tool ONLY when external Tool Functions are required to fetch or interact with data.
+The user CANNOT see this tool's output — you must respond to them in normal text output.
+
+DEFAULT USAGE (REQUIRED): Write ONE complete batch script that performs all needed Function calls. Do NOT call Tool Functions one-by-one across turns.
+
+REPL is allowed ONLY if:
+- A Function returns /* Unknown Schema */
+AND
+- Another Function strictly requires a specific field from that result.
+
+RULES:
+- At most ONE script per turn.
+- Never call the same Function twice with identical arguments.
+- Variables persist. Use 'var' or reassign (do not redeclare let/const).
+- The LAST evaluated expression is returned automatically. NEVER use 'return;' or var assignment on last line.
+- Final line: Variable assignments evaluate to null. Your script MUST end with an object (e.g., '({a, b});') to successfully return data.
+- Synchronous only. No async/await or external APIs.
+
+Available JavaScript Tool Functions inside the runtime:`+
+			"\n\n"+
+			docsFragment,
 		),
 		tools.WithArgSchema(CodeArgs{}),
 		tools.WithFunction(executor),
@@ -84,14 +125,15 @@ func adaptToolsToJSPTC(inputTools []tools.Tool) (tools.Tool, string, error) {
 
 	// create PTC system prompt fragment with tools
 	systemFragment := "\n\n" + getSystemFragmentJS() +
-		"\n## Available JavaScript Tool Functions\n\n" +
+		"\n## Available JavaScript Tool Functions inside the runtime:\n\n" +
 		docsFragment
 
 	return ptcTool, systemFragment, nil
 }
 
 // bindToolToVM wraps a Bellman tool as a JS function: toolName({ args... })
-func bindToolToJSVM(vm *goja.Runtime, t tools.Tool) error {
+func bindToolToJSVM(runtime *Runtime, t tools.Tool) error {
+	vm := runtime.JS
 	wrapper := func(call goja.FunctionCall) goja.Value {
 		// check if LLM passed multiple arguments (common mistake)
 		if len(call.Arguments) > 1 {
@@ -119,7 +161,7 @@ func bindToolToJSVM(vm *goja.Runtime, t tools.Tool) error {
 		})
 		if err != nil {
 			// return error string directly so the LLM can self-correct, e.g., "json: cannot unmarshal number..."
-			return vm.ToValue(map[string]string{"error": err.Error()})
+			return vm.ToValue(map[string]any{"ok": false, "error": err.Error()})
 		}
 
 		// unmarshal result back to JS object if possible
@@ -131,6 +173,10 @@ func bindToolToJSVM(vm *goja.Runtime, t tools.Tool) error {
 		// otherwise return raw string
 		return vm.ToValue(res)
 	}
+
+	// lock access to VM
+	runtime.Mutex.Lock()
+	defer runtime.Mutex.Unlock()
 
 	err := vm.Set(t.Name, wrapper)
 	if err != nil {
@@ -158,23 +204,29 @@ func formatToolSignature(t tools.Tool) string {
 		fields = append(fields, fmt.Sprintf("  %s: %s", name, a.Type))
 	}
 
-	argBlock := ""
+	argBlock := "{}"
 	if len(fields) > 0 {
 		argBlock = "{\n" + strings.Join(fields, ",\n") + "\n}"
-	} else {
-		argBlock = "{}"
 	}
 
-	//exampleArgs := buildExampleArgs(args)
+	// get return types - If schema is missing or empty, trigger the REPL warning
+	returnType := "unknown"
+	jsDocWarning := " /* Unknown Schema */"
 
-	return fmt.Sprintf(
-		`function %s(args: %s): %s
-- %s`,
-		t.Name,
-		argBlock,
-		inferReturnType(t),
-		t.Description,
-	)
+	isKnown := true
+	if t.ResponseSchema == nil || t.ResponseSchema.Type == "" {
+		isKnown = false
+	} else if t.ResponseSchema.Type == "object" && len(t.ResponseSchema.Properties) == 0 {
+		// Only objects with 0 properties are considered "Unknown"
+		isKnown = false
+	}
+	if isKnown {
+		returnType = SchemaToTS(t.ResponseSchema)
+		jsDocWarning = ""
+	}
+
+	return fmt.Sprintf("/**\n * %s\n * @returns {%s}%s\n */\ndeclare function %s(params: %s): %s;",
+		t.Description, returnType, jsDocWarning, t.Name, argBlock, returnType)
 }
 
 func extractArgs(s *schema.JSON) []ArgField {
@@ -203,12 +255,6 @@ func extractArgs(s *schema.JSON) []ArgField {
 	return args
 }
 
-func inferReturnType(t tools.Tool) string {
-	// If your Tool type exposes return schema, plug it in here.
-	// Otherwise be explicit and conservative.
-	return "json"
-}
-
 func mapJSONSchemaType(s *schema.JSON) string {
 	if s == nil {
 		return "unknown"
@@ -230,6 +276,60 @@ func mapJSONSchemaType(s *schema.JSON) string {
 	}
 }
 
+// SchemaToTS recursively converts a bellman schema.JSON into a TypeScript type string
+func SchemaToTS(s *schema.JSON) string {
+	if s == nil {
+		return "any"
+	}
+
+	switch s.Type {
+	case "string":
+		return "string"
+	case "integer", "number":
+		return "number"
+	case "boolean":
+		return "boolean"
+	case "array":
+		// Assuming schema.JSON has an Items field for array types
+		if s.Items != nil {
+			return fmt.Sprintf("%s[]", SchemaToTS(s.Items))
+		}
+		return "any[]"
+	case "object":
+		if len(s.Properties) > 0 {
+			var builder strings.Builder
+			builder.WriteString("{ ")
+
+			// Create a quick lookup map for required fields
+			reqMap := make(map[string]bool)
+			for _, r := range s.Required {
+				reqMap[r] = true
+			}
+
+			// Sort keys for deterministic output
+			keys := make([]string, 0, len(s.Properties))
+			for k := range s.Properties {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+
+			for _, key := range keys {
+				prop := s.Properties[key]
+				opt := "?"
+				if reqMap[key] {
+					opt = ""
+				}
+				builder.WriteString(fmt.Sprintf("%s%s: %s; ", key, opt, SchemaToTS(prop)))
+			}
+			builder.WriteString("}")
+			return builder.String()
+		}
+		return "Record<string, any>"
+	default:
+		return "any"
+	}
+}
+
 // guardRailJS guardrails code before exec; important since LLMs trained for diff. coding objectives
 func guardRailJS(code string) (string, error) { // TODO: add more/update guardrails
 	if code == "" {
@@ -238,9 +338,10 @@ func guardRailJS(code string) (string, error) { // TODO: add more/update guardra
 		return code, fmt.Errorf("error: %s", errMsg)
 	}
 
-	if strings.Contains(code, "return") && !strings.HasPrefix(strings.TrimSpace(code), "(function") {
-		code = fmt.Sprintf("(function() { %s })()", code)
-	}
+	// no longer relevant for stateful vm!
+	//if strings.Contains(code, "return") && !strings.HasPrefix(strings.TrimSpace(code), "(function") {
+	//	code = fmt.Sprintf("(function() { %s })()", code)
+	//}
 
 	if strings.Contains(code, "print( ") || strings.Contains(code, "console.log(") {
 		errMsg := "RuntimeError: Log functions (e.g., 'console.log' or 'print') are strictly FORBIDDEN in this environment. You must use return data via the function return only. Rewrite the code immediately."
@@ -257,54 +358,48 @@ func guardRailJS(code string) (string, error) { // TODO: add more/update guardra
 }
 
 func getSystemFragmentJS() string {
-	return `# Tool Return Conventions
-- Success may return undefined or null.
-- Failure returns a string error.
-- Absence of a return value means success.
-- Always inspect tool return values.
+	return `Your are an LLM-based AI Agent enhanced with Programmatic Tool-Calling (PTC).
+The PTC tool at your disposal is the 'code_execution' tool, use it to interact with data!
 
-# JavaScript Execution Environment (Goja)
+Tool calls can be costly, use only when necessary to fetch or interact with data, and write compact code.
 
-You are generating a single executable program, not a sequence of tool calls.
+# JavaScript Runtime (Goja) - Accessible through 'code_execution' Tool
 
-This environment executes exactly ONE JavaScript program per turn.
-You must invoke 'code_execution' at most once.
-Inside that program, you may call multiple tool functions as needed.
+- Write standard top-level JS. No async/await, no logging.
+- Variables persist across turns. Use 'var' (do not redeclare let/const).
+- The LAST evaluated expression is returned automatically. NEVER use 'return;' or var assignment on last line.
+- Final line: Variable assignments evaluate to null. Your script MUST end with an object (e.g., '({a, b});') to successfully return data.
+- Tool Functions are deterministic. NEVER call a Function twice with identical arguments. Read your history.
 
-Execution is part of solving the task.
-You may use execution results to compute the final answer.
+## When To Use This Tool
+Use 'code_execution' ONLY if external Tool Functions are required.
+If the request can be answered with reasoning or general knowledge → respond user directly in plain text (do NOT call the tool).
 
-You run in a minimal embedded JavaScript runtime.
-Not Node.js. Not a browser. No async. No console.
+## Default Execution Strategy — SINGLE BATCH (Required)
+Before writing code, determine if intermediate outputs are strictly required. 
+Your default behavior MUST be to write the entire solution in a SINGLE script. Batch all independent Function calls together.
 
-Only basic JavaScript syntax is available.
-All I/O and side effects must use provided tool functions.
-Tool functions are global. Do NOT prefix them with "functions." or any namespace.
+Example (Correct Default Strategy):
+var user = searchUsers({ query: "john" }); // returns 'unknown'
+var emailSent = sendEmail({ body: "Hello, let's meet." }); // returns 'boolean'
+({user, emailSent}); // Returns both results in a single object. No need to yield/pause.
 
-## When To Use code_execution
+### The ONLY Exception: REPL Yielding
+Use REPL IF AND ONLY IF:
+1) Function A returns /* Unknown Schema */, AND
+2) Another Function B strictly requires a specific field from A’s result.
 
-Use 'code_execution' ONLY if the task requires tool functions
-(file operations, network, data retrieval, etc).
+Yield control (STOP) IF AND ONLY IF Function A has an /* Unknown Schema */ AND Function B strictly requires a property from Function A's output.
+Execute Function A, put its result on the last line, and STOP. DO NOT guess property names.
 
-If no tool is required, respond in natural language.
-Never output JavaScript unless invoking 'code_execution'.
+## Finishing the Task (CRITICAL)
+This tool ONLY fetches and interacts with data. The user CANNOT see the output of this tool. 
+When you have the final answer, you MUST STOP using 'code_execution'. 
+To finish, YOU MUST write a normal, plain-text conversational response to the user.
 
-## If Using code_execution
+Do NOT call the tool again unless new information is required.
 
-Before invoking 'code_execution', determine ALL required tool calls and combine them into ONE complete script.
-
-- Invoke 'code_execution' exactly once per turn.
-- Provide one complete script wrapped exactly as:
-  (function() { ... })()
-- All logic and tool calls must be inside that script.
-- Assign tool results to variables before using them.
-- Execution is strictly synchronous. Do NOT use async or await.
-- You MUST return one final JSON value from the IIFE.
-- No logging or external APIs.
-
-If you invoke 'code_execution', your entire response must be
-a structured tool call with no text before or after.
-
-Never write code_execution({ ... }) as plain text.
+# Respond the User
+When you have completed the task, you MUST respond the users request directly in text!
 `
 }

@@ -23,6 +23,7 @@ func GetMockBellmanTools(enablePTC bool) []tools.Tool {
 		tools.WithDescription("Returns a mystical answer to a yes/no question."),
 		tools.WithArgSchema(FutureArgs{}),
 		tools.WithPTC(enablePTC),
+		tools.WithResponseType[string](),
 		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
 			var arg FutureArgs
 			if err := json.Unmarshal(call.Argument, &arg); err != nil {
@@ -35,7 +36,8 @@ func GetMockBellmanTools(enablePTC bool) []tools.Tool {
 				"The stars say yes.", "My sources say no.",
 			}
 			rand.Seed(time.Now().UnixNano())
-			return answers[rand.Intn(len(answers))], nil
+			ans := answers[rand.Intn(len(answers))]
+			return ans, nil
 		}),
 	)
 	mockTools = append(mockTools, predictTool)
@@ -107,23 +109,24 @@ func GetMockBellmanTools(enablePTC bool) []tools.Tool {
 	type CompanyArgs struct {
 		Name string `json:"name"`
 	}
+	// Define the return structure
+	type CompanyData struct {
+		ID          string `json:"company_id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Domain      string `json:"domain"`
+		Valuation   string `json:"valuation"`
+	}
+
 	companyTool := tools.NewTool("get_company",
 		tools.WithDescription("Gets company object by name. Returns id, description, domain, and valuation."),
 		tools.WithArgSchema(CompanyArgs{}),
 		tools.WithPTC(enablePTC),
+		tools.WithResponseType[CompanyData](),
 		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
 			var arg CompanyArgs
 			if err := json.Unmarshal(call.Argument, &arg); err != nil {
 				return "", err
-			}
-
-			// Define the return structure
-			type CompanyData struct {
-				ID          string `json:"id"`
-				Name        string `json:"name"`
-				Description string `json:"description"`
-				Domain      string `json:"domain"`
-				Valuation   string `json:"valuation"`
 			}
 
 			// Normalize input for easier matching
@@ -157,7 +160,7 @@ func GetMockBellmanTools(enablePTC bool) []tools.Tool {
 					Valuation:   "5B SEK",
 				}
 			default:
-				return fmt.Sprintf(`{"error": "Company '%s' not found. Available mock data: Saab, Ericsson, SAS"}`, arg.Name), nil
+				return fmt.Sprintf(`{"error": "Company '%s' not found. Available companies: Saab, Ericsson, SAS"}`, arg.Name), nil
 			}
 
 			// Marshal result to JSON
@@ -174,26 +177,25 @@ func GetMockBellmanTools(enablePTC bool) []tools.Tool {
 	type StockArgs struct {
 		CompanyId string `json:"company_id"`
 	}
-
+	// Define the return structure for Stock
+	type StockData struct {
+		Symbol   string  `json:"symbol"`
+		Price    float64 `json:"price"`
+		Currency string  `json:"currency"`
+		Change   string  `json:"day_change"`
+		High     float64 `json:"day_high"`
+		Low      float64 `json:"day_low"`
+	}
 	stockTool := tools.NewTool("get_stock",
 		tools.WithDescription("Gets stock price and details by company id. Returns symbol, price, currency."),
 		// FIX: Use StockArgs, not CompanyArgs
 		tools.WithArgSchema(StockArgs{}),
 		tools.WithPTC(enablePTC),
+		tools.WithResponseType[StockData](),
 		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
 			var arg StockArgs
 			if err := json.Unmarshal(call.Argument, &arg); err != nil {
 				return "", err
-			}
-
-			// Define the return structure for Stock
-			type StockData struct {
-				Symbol   string  `json:"symbol"`
-				Price    float64 `json:"price"`
-				Currency string  `json:"currency"`
-				Change   string  `json:"day_change"`
-				High     float64 `json:"day_high"`
-				Low      float64 `json:"day_low"`
 			}
 
 			var data StockData

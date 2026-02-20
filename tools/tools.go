@@ -35,6 +35,7 @@ const (
 	JavaScript ProgramLanguage = "js"
 	Python     ProgramLanguage = "python"
 	Go         ProgramLanguage = "go"
+	Lua        ProgramLanguage = "lua"
 )
 
 type ToolOption func(tool Tool) Tool
@@ -62,6 +63,18 @@ func WithArgSchema(arg any) ToolOption {
 	}
 }
 
+// WithResponseType defines the tool's return schema using a type parameter.
+func WithResponseType[T any]() ToolOption {
+	return func(tool Tool) Tool {
+		// Create a zero-value of type T (e.g., "" for string, 0 for int, or an empty struct)
+		var zero T
+
+		// Feed the zero-value into schema generator
+		tool.ResponseSchema = schema.From(zero)
+		return tool
+	}
+}
+
 func WithPTC(usePTC bool) ToolOption {
 	return func(tool Tool) Tool {
 		tool.UsePTC = usePTC
@@ -84,7 +97,8 @@ type Tool struct {
 	Description    string                                               `json:"description"`
 	ArgumentSchema *schema.JSON                                         `json:"argument_schema,omitempty"`
 	Function       func(ctx context.Context, call Call) (string, error) `json:"-"`
-	UsePTC         bool                                                 `json:"use_ptc"` // false is default
+	ResponseSchema *schema.JSON                                         `json:"response_schema,omitempty"` //TODO: whats the best representation? struct, json, other?
+	UsePTC         bool                                                 `json:"use_ptc"`                   // false is default
 }
 
 type Call struct {
