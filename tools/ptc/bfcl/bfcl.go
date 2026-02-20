@@ -30,6 +30,7 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 			Name        string          `json:"name"`
 			Description string          `json:"description"`
 			Parameters  json.RawMessage `json:"parameters"`
+			Response    json.RawMessage `json:"response"`
 		}
 
 		// Handle BFCL's nested "function" wrapper if present
@@ -51,45 +52,10 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 		// OpenAI rejects dots. "math.factorial" -> "math_factorial"
 		sanitizedName := invalidNameChars.ReplaceAllString(tDef.Name, "_")
 
-		// "dict" -> "object"
-		var paramSchema schema.JSON
-
-		if len(tDef.Parameters) > 0 {
-			var check map[string]interface{}
-			if err := json.Unmarshal(tDef.Parameters, &check); err == nil {
-
-				typeVal, _ := check["type"].(string)
-
-				// BFCL uses "dict", OpenAI wants "object"
-				if typeVal == "dict" {
-					check["type"] = "object"
-					typeVal = "object" // Update for the check below
-				}
-
-				// If type is NOT object (e.g. "string"), must wrap it
-				if typeVal != "" && typeVal != "object" {
-					wrapped := map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"arg": check, // Wrap original schema
-						},
-						"required": []string{"arg"},
-					}
-					fixedBytes, _ := json.Marshal(wrapped)
-					_ = json.Unmarshal(fixedBytes, &paramSchema)
-				} else {
-					// It's a valid object/dict, but we might have modified "type" in check
-					// So we marshal 'check' back, not 'tDef.Parameters'
-					fixedBytes, _ := json.Marshal(check)
-					_ = json.Unmarshal(fixedBytes, &paramSchema)
-				}
-			}
-		} else {
-			// Handle empty parameters
-			emptyObj := map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
-			b, _ := json.Marshal(emptyObj)
-			_ = json.Unmarshal(b, &paramSchema)
-		}
+		paramSchema := parseSchemaRawToJSON(tDef.Parameters)
+		responseSchema := parseSchemaRawToJSON(tDef.Response)
+		normalizeBFCLSchema(&paramSchema, false)
+		normalizeBFCLSchema(&responseSchema, true)
 
 		tool := tools.NewTool(sanitizedName,
 			tools.WithDescription(tDef.Description),
@@ -98,10 +64,94 @@ func ParseJsonSchemaTools(rawTools []interface{}, enablePTC bool) []tools.Tool {
 		)
 
 		tool.ArgumentSchema = &paramSchema
+		tool.ResponseSchema = &responseSchema
+
 		parsedTools = append(parsedTools, tool)
 	}
 
 	return parsedTools
+}
+
+func parseSchemaRawToJSON(Parameters json.RawMessage) schema.JSON {
+	// "dict" -> "object"
+	var paramSchema schema.JSON
+
+	if len(Parameters) > 0 {
+		var check map[string]interface{}
+		if err := json.Unmarshal(Parameters, &check); err == nil {
+
+			typeVal, _ := check["type"].(string)
+
+			// BFCL uses "dict", OpenAI wants "object"
+			if typeVal == "dict" {
+				check["type"] = "object"
+				typeVal = "object" // Update for the check below
+			}
+
+			// If type is NOT object (e.g. "string"), must wrap it
+			if typeVal != "" && typeVal != "object" {
+				wrapped := map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"arg": check, // Wrap original schema
+					},
+					"required": []string{"arg"},
+				}
+				fixedBytes, _ := json.Marshal(wrapped)
+				_ = json.Unmarshal(fixedBytes, &paramSchema)
+			} else {
+				// It's a valid object/dict, but we might have modified "type" in check
+				// So we marshal 'check' back, not 'tDef.Parameters'
+				fixedBytes, _ := json.Marshal(check)
+				_ = json.Unmarshal(fixedBytes, &paramSchema)
+			}
+		}
+	} else {
+		// Handle empty parameters
+		emptyObj := map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
+		b, _ := json.Marshal(emptyObj)
+		_ = json.Unmarshal(b, &paramSchema)
+	}
+
+	return paramSchema
+}
+
+// normalizeBFCLSchema recursively cleans non-standard types from BFCL datasets
+func normalizeBFCLSchema(s *schema.JSON, req bool) { // Replace *schema.JSON with your actual struct type if different
+	if s == nil {
+		return
+	}
+
+	// 1. Fix the Pythonic/BFCL type dialects
+	switch s.Type {
+	case "dict":
+		s.Type = "object"
+	case "list":
+		s.Type = "array"
+	case "int":
+		s.Type = "integer"
+	case "float":
+		s.Type = "number"
+	case "bool":
+		s.Type = "boolean"
+	}
+
+	// if response --> set all fields to required
+	if req && s.Type == "object" && len(s.Properties) > 0 && len(s.Required) == 0 {
+		for key := range s.Properties {
+			s.Required = append(s.Required, key)
+		}
+	}
+
+	// Recursively traverse and fix nested properties (for objects)
+	for _, prop := range s.Properties {
+		normalizeBFCLSchema(prop, req)
+	}
+
+	// Recursively traverse and fix array items (for lists/arrays)
+	if s.Items != nil {
+		normalizeBFCLSchema(s.Items, req)
+	}
 }
 
 // safe implementation avoiding recursion traps
