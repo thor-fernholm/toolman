@@ -84,9 +84,6 @@ func adaptToolsToJSPTC(runtime *Runtime, inputTools []tools.Tool) (tools.Tool, s
 				return "", err
 			}
 		}
-
-		//fmt.Printf("________ Code response:\n%s\n", string(jsonBytes))
-
 		return string(jsonBytes), nil
 	}
 
