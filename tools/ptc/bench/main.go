@@ -12,13 +12,13 @@ import (
 
 func main() {
 	// godotenv.Load() ...
-	err := godotenv.Load()
-	if err != nil {
-		panic(err)
+	if err := godotenv.Load(); err != nil {
+		log.Printf("warning: failed to load .env: %v", err)
 	}
 
 	// Register API Endpoint
 	http.HandleFunc("/bfcl", MiddlewareDebugLogger("BFCL", bfcl.HandleGenerateBFCL))
+	http.HandleFunc("/loca", HandleGenerateLOCA)
 	http.HandleFunc("/cfb", MiddlewareDebugLogger("CFB", cfb.HandleGenerateCFB))
 
 	// Register Debug UI Endpoints
@@ -29,6 +29,7 @@ func main() {
 	fmt.Println("---------------------------------------------------------")
 	fmt.Println(" Toolman Bench Server Running")
 	fmt.Println(" BFCL API Endpoint:   http://localhost:8080/bfcl")
+	fmt.Println(" LOCA API Endpoint:   http://localhost:8080/loca")
 	fmt.Println(" CFB API Endpoint:    http://localhost:8080/cfb")
 	fmt.Println(" BFCL Debug UI:       http://localhost:8080/debug")
 	fmt.Println("---------------------------------------------------------")
