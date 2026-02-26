@@ -636,6 +636,11 @@ func HandleGenerateLOCA(w http.ResponseWriter, r *http.Request) {
 		req.MaxTokens = 16384
 	}
 
+	// Provider quirks: some models (e.g. OpenAI GPT-5) only support the default
+	// temperature value. If the request omits temperature, it unmarshals as 0.
+	// Normalize to a supported value to avoid hard failures.
+	normalizeModelParamsLOCA(&req)
+
 	ctx := r.Context()
 	if req.TimeoutMS > 0 {
 		var cancel context.CancelFunc
@@ -670,6 +675,24 @@ func HandleGenerateLOCA(w http.ResponseWriter, r *http.Request) {
 
 	trace, final, hist, inTok, outTok, err := runLOCANormal(ctx, bClient, mcp, reg, req)
 	writeLOCAResponse(w, start, trace, hist, "", final, inTok, outTok, err)
+}
+
+func normalizeModelParamsLOCA(req *locaRequest) {
+	if req == nil {
+		return
+	}
+	model := strings.ToLower(strings.TrimSpace(req.BellmanModel))
+	if model == "" {
+		return
+	}
+
+	// OpenAI GPT-5 currently supports only the default temperature (1).
+	// Error example: "Unsupported value: 'temperature' does not support 0 ..."
+	if strings.Contains(model, "gpt-5") {
+		if req.Temperature != 1 {
+			req.Temperature = 1
+		}
+	}
 }
 
 func injectAllowedWorkspaceRootLOCA(ctx context.Context, mcp *mcpClient, reg *toolRegistry, req *locaRequest) {
@@ -1120,6 +1143,7 @@ func runLOCAPTC(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, re
 		}
 		inTok += res.Metadata.InputTokens
 		outTok += res.Metadata.OutputTokens
+		println("Input token: ", inTok)
 		if res.IsText() {
 			text, _ := res.AsText()
 			hist = append(hist, prompt.AsAssistant(text))
