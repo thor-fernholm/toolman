@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/dop251/goja"
+	langfuse "github.com/henomis/langfuse-go"
+	"github.com/henomis/langfuse-go/model"
 	"github.com/joho/godotenv"
 	"github.com/modfin/bellman/agent"
 	"github.com/modfin/bellman/models/embed"
@@ -31,13 +33,32 @@ func TestToolman(t *testing.T) {
 	bellmanUrl := os.Getenv("BELLMAN_URL")
 	bellmanToken := os.Getenv("BELLMAN_TOKEN")
 
+	if os.Getenv("LANGFUSE_HOST") == "" ||
+		os.Getenv("LANGFUSE_PUBLIC_KEY") == "" ||
+		os.Getenv("LANGFUSE_SECRET_KEY") == "" {
+		t.Skip("Langfuse env not set (LANGFUSE_HOST/LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY)")
+	}
+
+	l := langfuse.New(context.Background())
+
+	trace, err := l.Trace(&model.Trace{Name: "test-trace"})
+	if err != nil {
+		panic(err)
+	}
+
+	span, err := l.Span(&model.Span{Name: "test-span", TraceID: trace.ID}, nil)
+	if err != nil {
+		panic(err)
+	}
+
 	allTools := ptc.GetMockBellmanTools(true)
 	models := []gen.Model{openai.GenModel_gpt4o_mini, vertexai.GenModel_gemini_2_5_flash_latest, anthropic.GenModel_3_haiku_20240307}
 	//models = []gen.Model{openai.GenModel_gpt4o_mini}
 
 	// create Bellman llm and run agent
+	systemPrompt := "# Role\nYou are a helpful LLM assistant."
 	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
-	llm := client.Generator().System("# Role\nYou are a helpful LLM assistant.").
+	llm := client.Generator().System(systemPrompt).
 		SetTools(allTools...).SetPTCLanguage(tools.JavaScript).Temperature(0)
 
 	userPrompt := "1. Do you know what PTC is (programmatic tool calling), and how LLMs call tools? If yes; answer me which tool at your disposal is PTC. If no; why not?"
@@ -46,6 +67,56 @@ func TestToolman(t *testing.T) {
 	//	"Rules:\n 1. Start with any number n.\n 2. If n is even, divide by 2.\n 3. If n is odd, multiply by 3 and add 1.\n 4. Repeat until n becomes 1." +
 	//	"\nReturn the starting number and the length of its sequence."
 	userPrompt += "also, 5. get me the stock info for saab, ericsson."
+
+	generation, err := l.Generation(
+		&model.Generation{
+			TraceID: trace.ID,
+			Name:    "test-generation",
+			Model:   fmt.Sprintf("%v/%v", llm.Request.Model.Provider, llm.Request.Model.Name),
+			ModelParameters: model.M{
+				"maxTokens":   "1000",
+				"temperature": "0.9",
+			},
+			Input: []model.M{
+				{
+					"role":    "system",
+					"content": systemPrompt,
+				},
+				{
+					"role":    "user",
+					"content": userPrompt,
+				},
+			},
+			Metadata: model.M{
+				"key": "value",
+			},
+		},
+		&span.ID,
+	)
+
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = l.Event(
+		&model.Event{
+			Name:    "test-event",
+			TraceID: trace.ID,
+			Metadata: model.M{
+				"key": "value",
+			},
+			Input: model.M{
+				"key": "value",
+			},
+			Output: model.M{
+				"key": "value",
+			},
+		},
+		&generation.ID,
+	)
+	if err != nil {
+		panic(err)
+	}
 
 	// run all models
 	for _, m := range models {
@@ -70,10 +141,36 @@ func TestToolman(t *testing.T) {
 			for i, m := range res.Prompts {
 				fmt.Printf("prompt %v: { role: %v, text: %v, tool_call: %v, tool_response: %v }\n", i, m.Role, m.Text, m.ToolCall, m.ToolResponse)
 			}
+
+			generation.Output = model.M{
+				"completion": fmt.Sprintf("%v", res.Result.Text),
+			}
+			_, err = l.GenerationEnd(generation)
+			if err != nil {
+				panic(err)
+			}
+
+			_, err = l.Score(
+				&model.Score{
+					TraceID: trace.ID,
+					Name:    "test-score",
+					Value:   0.9,
+				},
+			)
+			if err != nil {
+				panic(err)
+			}
+
+			_, err = l.SpanEnd(span)
+			if err != nil {
+				panic(err)
+			}
+
 			// pretty print
 			prettyPrint(res)
 		}
 	}
+	l.Flush(context.Background())
 }
 
 func TestVectorSearch(t *testing.T) {
@@ -142,12 +239,32 @@ func TestVectorSearch(t *testing.T) {
 
 func TestAutoPTC(t *testing.T) {
 	// get env vars
+
 	err := godotenv.Load()
+
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
 	bellmanUrl := os.Getenv("BELLMAN_URL")
 	bellmanToken := os.Getenv("BELLMAN_TOKEN")
+
+	if os.Getenv("LANGFUSE_HOST") == "" ||
+		os.Getenv("LANGFUSE_PUBLIC_KEY") == "" ||
+		os.Getenv("LANGFUSE_SECRET_KEY") == "" {
+		t.Skip("Langfuse env not set (LANGFUSE_HOST/LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY)")
+	}
+
+	l := langfuse.New(context.Background())
+
+	trace, err := l.Trace(&model.Trace{Name: "test-trace"})
+	if err != nil {
+		panic(err)
+	}
+
+	span, err := l.Span(&model.Span{Name: "test-span", TraceID: trace.ID}, nil)
+	if err != nil {
+		panic(err)
+	}
 
 	// setup goja
 	vm := goja.New()
@@ -182,6 +299,56 @@ You solve complex logic by writing JavaScript code for the code_execution tool.`
 		llm = llm.Model(vertexai.GenModel_gemini_2_5_flash_latest)
 	}
 
+	generation, err := l.Generation(
+		&model.Generation{
+			TraceID: trace.ID,
+			Name:    "test-generation",
+			Model:   fmt.Sprintf("%v/%v", llm.Request.Model.Provider, llm.Request.Model.Name),
+			ModelParameters: model.M{
+				"maxTokens":   "1000",
+				"temperature": "0.9",
+			},
+			Input: []model.M{
+				{
+					"role":    "system",
+					"content": systemPrompt,
+				},
+				{
+					"role":    "user",
+					"content": "Please generate a summary of the following documents \nThe engineering department defined the following OKR goals...\nThe marketing department defined the following OKR goals...",
+				},
+			},
+			Metadata: model.M{
+				"key": "value",
+			},
+		},
+		&span.ID,
+	)
+
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = l.Event(
+		&model.Event{
+			Name:    "test-event",
+			TraceID: trace.ID,
+			Metadata: model.M{
+				"key": "value",
+			},
+			Input: model.M{
+				"key": "value",
+			},
+			Output: model.M{
+				"key": "value",
+			},
+		},
+		&generation.ID,
+	)
+	if err != nil {
+		panic(err)
+	}
+
 	// prompt, expected result --> <bad-bellman-joke> and 2222222211
 	userPrompt := "Predict the future, convert 69 usd to sek, and then generate a secret password."
 
@@ -200,6 +367,32 @@ You solve complex logic by writing JavaScript code for the code_execution tool.`
 	for i, m := range res.Prompts {
 		fmt.Printf("prompt %v: %v\n", i, m)
 	}
+
+	generation.Output = model.M{
+		"completion": fmt.Sprintf("%v", res.Result.Text),
+	}
+	_, err = l.GenerationEnd(generation)
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = l.Score(
+		&model.Score{
+			TraceID: trace.ID,
+			Name:    "test-score",
+			Value:   0.9,
+		},
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = l.SpanEnd(span)
+	if err != nil {
+		panic(err)
+	}
+
+	l.Flush(context.Background())
 
 	// pretty print
 	prettyPrint(res)
