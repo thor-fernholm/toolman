@@ -203,6 +203,10 @@ func (b *Generator) EnsureRuntimeSession() *Generator {
 		if b.Runtime.JS == nil {
 			return b.ResetRuntimeSession()
 		}
+	case tools.Python:
+		if b.Runtime.Python == nil {
+			return b.ResetRuntimeSession()
+		}
 	default: // default to JS
 		if b.Runtime.JS == nil {
 			return b.ResetRuntimeSession()
@@ -218,10 +222,13 @@ func (b *Generator) ResetRuntimeSession() *Generator {
 
 	// dereference all vms to garbage collect them
 	b.Runtime.JS = nil
+	b.Runtime.Python = nil
 
 	switch b.Request.PTCLanguage {
 	case tools.JavaScript:
 		b.Runtime.JS = goja.New()
+	case tools.Python:
+		b.Runtime.Python = &ptc.PythonRuntime{}
 	default:
 		b.Runtime.JS = goja.New()
 	}

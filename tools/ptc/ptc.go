@@ -9,9 +9,9 @@ import (
 )
 
 type Runtime struct {
-	Mutex sync.Mutex // Only one operator at a time --> prevent unexpected concurrency runtime errors
-	JS    *goja.Runtime
-	// Python *python.Environment <-- other code exec vm envs.
+	Mutex  sync.Mutex // Only one operator at a time --> prevent unexpected concurrency runtime errors
+	JS     *goja.Runtime
+	Python *PythonRuntime // custom python runtime
 }
 
 const (
@@ -40,7 +40,7 @@ func AdaptToolsToPTC(runtime *Runtime, ptcTools []tools.Tool, language tools.Pro
 	case tools.JavaScript:
 		return adaptToolsToJSPTC(runtime, ptcTools)
 	case tools.Python:
-		return tools.Tool{}, "", fmt.Errorf("ptc python not implemented")
+		return adaptToolsToPythonPTC(runtime.Python, ptcTools)
 	case tools.Go:
 		return tools.Tool{}, "", fmt.Errorf("ptc go not implemented")
 	case tools.Lua:
