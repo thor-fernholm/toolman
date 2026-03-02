@@ -18,6 +18,7 @@ import (
 	"github.com/modfin/bellman/schema"
 	"github.com/modfin/bellman/tools"
 	"github.com/modfin/bellman/tools/ptc"
+	"github.com/modfin/bellman/tools/tracing"
 )
 
 // --- NESTFUL benchmark adapter (single-shot, with/without PTC) ---
@@ -110,6 +111,27 @@ func NestfulHandler(w http.ResponseWriter, r *http.Request, client *bellman.Bell
 		httpErr(w, fmt.Errorf("invalid tools: %w", err), http.StatusBadRequest)
 		return
 	}
+
+	ctx := r.Context()
+	tr := tracing.NewLangfuseTracer(ctx)
+
+	traceID := fmt.Sprintf("nestful-%d", time.Now().UnixNano())
+
+	run := tr.StartRun(ctx, tracing.RunInfo{
+		TraceID:     traceID,
+		TraceName:   "toolman.nestful",
+		RootSpan:    "run",
+		Benchmark:   "nestful",
+		TaskID:      "",
+		PTCEnabled:  req.EnablePTC,
+		Model:       fmt.Sprintf("%v/%v", model.Provider, model.Name),
+		Temperature: req.Temperature,
+		MaxTokens:   req.MaxTokens,
+		ToolsetSize: len(parsedTools),
+	}, map[string]any{
+		"query":       req.Query,
+		"tool_choice": choice,
+	})
 	for i := range parsedTools {
 		parsedTools[i].UsePTC = req.EnablePTC
 		// Never executed; just to keep tool refs non-nil.
@@ -135,14 +157,39 @@ func NestfulHandler(w http.ResponseWriter, r *http.Request, client *bellman.Bell
 		return
 	}
 
-	res, err := llm.Prompt(prompt.AsUser(req.Query))
+	//res, err := llm.Prompt(prompt.AsUser(req.Query))
+	var res *gen.Response
+	_, err = run.TraceLLM(ctx, tracing.LLMCall{
+		Name:         "llm.prompt",
+		Model:        fmt.Sprintf("%v/%v", model.Provider, model.Name),
+		SystemPrompt: req.SystemPrompt,
+		UserPrompt:   req.Query,
+		Attempt:      1,
+	}, func(ctx context.Context) (tracing.LLMResult, error) {
+		r2, e := llm.Prompt(prompt.AsUser(req.Query))
+		res = r2
+
+		usage := map[string]any{}
+		if r2 != nil {
+			usage["input_tokens"] = r2.Metadata.InputTokens
+			usage["output_tokens"] = r2.Metadata.OutputTokens
+			usage["total_tokens"] = r2.Metadata.TotalTokens
+		}
+		return tracing.LLMResult{Text: "", Usage: usage}, e
+	})
 	println("LMM resp", res, err)
 	if err != nil {
 		httpErr(w, fmt.Errorf("upstream error: %w", err), http.StatusBadGateway)
 		return
 	}
 
-	generated, content := nestfulGeneratedText(res, parsedTools, nameMap, outKeysByTool, req.JSExtractTimeoutMs)
+	//generated, content := nestfulGeneratedText(res, parsedTools, nameMap, outKeysByTool, req.JSExtractTimeoutMs)
+	generated, content := nestfulGeneratedText(run, res, parsedTools, nameMap, outKeysByTool, req.JSExtractTimeoutMs)
+	run.End(nil, map[string]any{
+		"generated_text_len": len(generated),
+		"content":            content,
+	})
+	tr.Flush(ctx)
 	writeJSON(w, http.StatusOK, NestfulBenchmarkResponse{
 		GeneratedText: generated,
 		Content:       content,
@@ -227,7 +274,8 @@ func parseNestfulTools(raw []any) ([]tools.Tool, map[string]string, map[string][
 	return parsed, nameMap, outKeysByTool, nil
 }
 
-func nestfulGeneratedText(res *gen.Response, availableTools []tools.Tool, nameMap map[string]string, outKeysByTool map[string][]string, timeoutMs int) (generated string, content string) {
+// func nestfulGeneratedText(run *tracing.Run, res *gen.Response, availableTools []tools.Tool, nameMap map[string]string, outKeysByTool map[string][]string, timeoutMs int) (generated string, content string) {
+func nestfulGeneratedText(run *tracing.Run, res *gen.Response, availableTools []tools.Tool, nameMap map[string]string, outKeysByTool map[string][]string, timeoutMs int) (generated string, content string) {
 	if !res.IsTools() {
 		text, _ := res.AsText()
 		return "[]", text
@@ -243,7 +291,8 @@ func nestfulGeneratedText(res *gen.Response, availableTools []tools.Tool, nameMa
 				errMsgs = append(errMsgs, fmt.Sprintf("code_execution args unmarshal error: %v", err))
 				continue
 			}
-			seq, errMsg := executeAndExtractNestful(codeArgs.Code, availableTools, outKeysByTool, timeoutMs)
+			//seq, errMsg := executeAndExtractNestful(codeArgs.Code, availableTools, outKeysByTool, timeoutMs)
+			seq, errMsg := executeAndExtractNestful(run, codeArgs.Code, availableTools, outKeysByTool, timeoutMs)
 			if errMsg != "" {
 				errMsgs = append(errMsgs, errMsg)
 			}
@@ -272,7 +321,8 @@ func nestfulGeneratedText(res *gen.Response, availableTools []tools.Tool, nameMa
 	return string(mustJSON(out)), strings.Join(errMsgs, "\n")
 }
 
-func executeAndExtractNestful(jsCode string, availableTools []tools.Tool, outKeysByTool map[string][]string, timeoutMs int) ([]map[string]any, string) {
+// func executeAndExtractNestful(jsCode string, availableTools []tools.Tool, outKeysByTool map[string][]string, timeoutMs int) ([]map[string]any, string) {
+func executeAndExtractNestful(run *tracing.Run, jsCode string, availableTools []tools.Tool, outKeysByTool map[string][]string, timeoutMs int) ([]map[string]any, string) {
 	vm := goja.New()
 	var captured []map[string]any
 
@@ -319,14 +369,43 @@ func executeAndExtractNestful(jsCode string, availableTools []tools.Tool, outKey
 			_ = normalizeVarRefs(argsMap)
 			captured = append(captured, map[string]any{"name": tName, "arguments": argsMap})
 
+			run.EventIO(
+				"tool.call",
+				map[string]any{
+					"name":      tName,
+					"arguments": argsMap,
+				},
+				map[string]any{
+					"placeholder_output": outObj,
+				},
+				map[string]any{
+					"tool.name": tName,
+					"index":     len(captured),
+				},
+			)
+
 			// Return a JS object so the model can chain on declared output keys.
 			return vm.ToValue(outObj)
 		}
 		_ = vm.Set(tName, interceptor)
 	}
 
-	if _, err := vm.RunString(guarded); err != nil {
-		return captured, fmt.Sprintf("code_execution run error: %v", err)
+	//if _, err := vm.RunString(guarded); err != nil {
+	//	return captured, fmt.Sprintf("code_execution run error: %v", err) }
+
+	_, execErr := run.TraceExec(context.Background(), tracing.ExecCall{
+		Name:      "exec.goja",
+		Language:  "javascript",
+		ScriptLen: len(guarded),
+		TimeoutMs: timeoutMs,
+		Attempt:   1,
+	}, func(ctx context.Context) (tracing.ExecResult, error) {
+		_, err := vm.RunString(guarded)
+		return tracing.ExecResult{}, err
+	})
+
+	if execErr != nil {
+		return captured, fmt.Sprintf("code_execution run error: %v", execErr)
 	}
 	fmt.Println("Guarded", guarded)
 	fmt.Println("captured", captured)

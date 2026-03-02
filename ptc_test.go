@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/dop251/goja"
 	langfuse "github.com/henomis/langfuse-go"
@@ -21,6 +22,7 @@ import (
 	"github.com/modfin/bellman/services/vertexai"
 	"github.com/modfin/bellman/tools"
 	"github.com/modfin/bellman/tools/ptc"
+	"github.com/modfin/bellman/tools/tracing"
 	"github.com/wizenheimer/comet"
 )
 
@@ -248,24 +250,6 @@ func TestAutoPTC(t *testing.T) {
 	bellmanUrl := os.Getenv("BELLMAN_URL")
 	bellmanToken := os.Getenv("BELLMAN_TOKEN")
 
-	if os.Getenv("LANGFUSE_HOST") == "" ||
-		os.Getenv("LANGFUSE_PUBLIC_KEY") == "" ||
-		os.Getenv("LANGFUSE_SECRET_KEY") == "" {
-		t.Skip("Langfuse env not set (LANGFUSE_HOST/LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY)")
-	}
-
-	l := langfuse.New(context.Background())
-
-	trace, err := l.Trace(&model.Trace{Name: "test-trace"})
-	if err != nil {
-		panic(err)
-	}
-
-	span, err := l.Span(&model.Span{Name: "test-span", TraceID: trace.ID}, nil)
-	if err != nil {
-		panic(err)
-	}
-
 	// setup goja
 	vm := goja.New()
 	vm.Set("CONFIG", map[string]string{
@@ -280,6 +264,8 @@ func TestAutoPTC(t *testing.T) {
 	mockTools := ptc.GetMockBellmanTools(true)
 	//regularTools, PTCTools := ptc.AdaptToolsToPTC(vm, mockTools, gen.JavaScript)
 	//allTools := append(regularTools, PTCTools...)
+	ctx := context.Background()
+	tr := tracing.NewLangfuseTracer(ctx)
 
 	// define system prompt
 	const systemPrompt = `## Role
@@ -299,66 +285,51 @@ You solve complex logic by writing JavaScript code for the code_execution tool.`
 		llm = llm.Model(vertexai.GenModel_gemini_2_5_flash_latest)
 	}
 
-	generation, err := l.Generation(
-		&model.Generation{
-			TraceID: trace.ID,
-			Name:    "test-generation",
-			Model:   fmt.Sprintf("%v/%v", llm.Request.Model.Provider, llm.Request.Model.Name),
-			ModelParameters: model.M{
-				"maxTokens":   "1000",
-				"temperature": "0.9",
-			},
-			Input: []model.M{
-				{
-					"role":    "system",
-					"content": systemPrompt,
-				},
-				{
-					"role":    "user",
-					"content": "Please generate a summary of the following documents \nThe engineering department defined the following OKR goals...\nThe marketing department defined the following OKR goals...",
-				},
-			},
-			Metadata: model.M{
-				"key": "value",
-			},
-		},
-		&span.ID,
-	)
-
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = l.Event(
-		&model.Event{
-			Name:    "test-event",
-			TraceID: trace.ID,
-			Metadata: model.M{
-				"key": "value",
-			},
-			Input: model.M{
-				"key": "value",
-			},
-			Output: model.M{
-				"key": "value",
-			},
-		},
-		&generation.ID,
-	)
-	if err != nil {
-		panic(err)
-	}
-
 	// prompt, expected result --> <bad-bellman-joke> and 2222222211
 	userPrompt := "Predict the future, convert 69 usd to sek, and then generate a secret password."
 
+	run := tr.StartRun(ctx, tracing.RunInfo{
+		TraceID:     fmt.Sprintf("autoptc-%d", time.Now().UnixNano()),
+		TraceName:   "toolman.autoptc",
+		RootSpan:    "run",
+		PTCEnabled:  true,
+		Model:       "Gemini",
+		Temperature: 0,
+		MaxTokens:   0,
+		ToolsetSize: len(mockTools),
+	}, map[string]any{
+		"user_prompt": userPrompt,
+	})
+
 	var res *agent.Result[Result]
-	switch llm.Request.Model.Provider {
-	case vertexai.Provider:
-		res, err = agent.RunWithToolsOnly[Result](10, 0, llm, prompt.AsUser(userPrompt))
-	default:
-		res, err = agent.Run[Result](10, 0, llm, prompt.AsUser(userPrompt))
-	}
+	llmRes, err := run.TraceLLM(ctx, tracing.LLMCall{
+		Name:         "llm.compelation",
+		Model:        "Gemmini",
+		SystemPrompt: systemPrompt,
+		UserPrompt:   userPrompt,
+		Attempt:      1,
+	}, func(ctx context.Context) (tracing.LLMResult, error) {
+		ctx = tracing.WithRun(ctx, run)
+		switch llm.Request.Model.Provider {
+		case vertexai.Provider:
+			res, err = agent.RunWithToolsOnly[Result](10, 0, llm, prompt.AsUser(userPrompt))
+		default:
+			res, err = agent.Run[Result](10, 0, llm, prompt.AsUser(userPrompt))
+		}
+		out := res.Result.Text
+
+		return tracing.LLMResult{
+			Text:  out,
+			Usage: map[string]any{},
+		}, err
+
+	})
+
+	run.End(err, map[string]any{
+		"final": llmRes.Text,
+	})
+
+	tr.Flush(ctx)
 
 	if err != nil {
 		log.Fatalf("Prompt() error = %v", err)
@@ -367,32 +338,6 @@ You solve complex logic by writing JavaScript code for the code_execution tool.`
 	for i, m := range res.Prompts {
 		fmt.Printf("prompt %v: %v\n", i, m)
 	}
-
-	generation.Output = model.M{
-		"completion": fmt.Sprintf("%v", res.Result.Text),
-	}
-	_, err = l.GenerationEnd(generation)
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = l.Score(
-		&model.Score{
-			TraceID: trace.ID,
-			Name:    "test-score",
-			Value:   0.9,
-		},
-	)
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = l.SpanEnd(span)
-	if err != nil {
-		panic(err)
-	}
-
-	l.Flush(context.Background())
 
 	// pretty print
 	prettyPrint(res)
