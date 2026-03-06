@@ -296,10 +296,14 @@ func (t *nestfulTrace) finishLLMSpan(res *gen.Response, err error) {
 				attribute.String("gen_ai.completion", string(outJSON)),
 			)
 		} else {
-			outJSON, _ := json.Marshal(res.Tools)
-			t.LLMSpan.SetAttributes(
-				attribute.String("gen_ai.completion", string(outJSON)),
-			)
+			pretty := make([]map[string]any, 0, len(res.Tools))
+			for _, tc := range res.Tools {
+				var args any
+				_ = json.Unmarshal(tc.Argument, &args)
+				pretty = append(pretty, map[string]any{"name": tc.Name, "arguments": args})
+			}
+			outJSON, _ := json.MarshalIndent(pretty, "", " ")
+			t.LLMSpan.SetAttributes(attribute.String("gen_ai.completion", string(outJSON)))
 		}
 
 		t.LLMSpan.SetAttributes(
