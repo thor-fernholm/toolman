@@ -68,6 +68,14 @@ type extractMeta struct {
 	CapturedJSONTrunc string
 }
 
+type nestfulTrace struct {
+	Tracer   trace.Tracer
+	RootCtx  context.Context
+	RootSpan trace.Span
+	LLMCtx   context.Context
+	LLMSpan  trace.Span
+}
+
 // Regex to find invalid tool-name characters.
 var invalidNameChars = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 
@@ -93,18 +101,12 @@ func NesfulHandlerFromEnv() http.HandlerFunc {
 }
 
 // NestfulHandler exposes a single-shot endpoint that returns predicted tool-call sequences in NESTFUL's format.
-//
-// - If EnablePTC=false: reads res.Tools and returns [{name,arguments,label}, ...]
-// - If EnablePTC=true: expects code_execution; runs JS in goja with interceptors and returns the extracted sequence.
-//
-// Tools are never executed.
-
 func NestfulHandler(w http.ResponseWriter, r *http.Request, client *bellman.Bellman, defaultModelFQN string) {
-
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
 	var req NestfulBenchmarkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpErr(w, fmt.Errorf("invalid json: %w", err), http.StatusBadRequest)
@@ -120,68 +122,39 @@ func NestfulHandler(w http.ResponseWriter, r *http.Request, client *bellman.Bell
 	if req.JSExtractTimeoutMs <= 0 {
 		req.JSExtractTimeoutMs = 5000
 	}
+
 	choice := strings.ToLower(strings.TrimSpace(req.ToolChoice))
 	if choice == "" {
 		choice = "required"
 	}
-	tracer := otel.Tracer("toolman/nestful")
+
 	ctx := r.Context()
-
 	sampleID := benchSampleID(r)
-	ctx, root := tracer.Start(ctx, "nestful.request")
-	defer root.End()
-
-	root.SetAttributes(
-		attribute.String("benchmark.name", "nestful"),
-		attribute.String("benchmark.sample_id", sampleID),
-		attribute.Bool("ptc.enabled", req.EnablePTC),
-		attribute.String("tool.choice", choice),
-	)
 
 	if strings.TrimSpace(defaultModelFQN) == "" {
 		defaultModelFQN = "OpenAI/gpt-4o"
 	}
 	model, err := parseModelFQN(defaultModelFQN)
 	if err != nil {
-		root.RecordError(err)
-		root.SetStatus(codes.Error, err.Error())
 		httpErr(w, fmt.Errorf("invalid model: %w", err), http.StatusBadRequest)
 		return
 	}
 
-	root.SetAttributes(
-		attribute.String("gen_ai.request.model", fmt.Sprintf("%v/%v", model.Provider, model.Name)),
-	)
-
 	parsedTools, nameMap, outKeysByTool, err := parseNestfulTools(req.Tools)
 	if err != nil {
-		root.RecordError(err)
-		root.SetStatus(codes.Error, err.Error())
 		httpErr(w, fmt.Errorf("invalid tools: %w", err), http.StatusBadRequest)
 		return
 	}
 
-	root.SetAttributes(
-		attribute.Int("gen_ai.tools.count", len(parsedTools)),
-		attribute.String("gen_ai.tools.digest", toolsDigest(req.Tools)),
-	)
+	tr := startNestfulTrace(ctx, req, sampleID, choice, model, parsedTools)
+	defer tr.RootSpan.End()
 
-	if len(parsedTools) <= 50 {
-		names := make([]string, 0, len(parsedTools))
-		for _, t := range parsedTools {
-			names = append(names, t.Name)
-		}
-		root.SetAttributes(attribute.String("gen_ai.tools.names", strings.Join(names, ",")))
-	}
 	var callIdx uint64
 	for i := range parsedTools {
 		parsedTools[i].UsePTC = req.EnablePTC
-		// Never executed; just to keep tool refs non-nil.
-		//parsedTools[i].Function = func(ctx context.Context, call tools.Call) (string, error) { return "{}", nil }
 		parsedTools[i].Function = func(ctx context.Context, call tools.Call) (string, error) {
 			idx := atomic.AddUint64(&callIdx, 1)
 
-			// call.Name is the sanitized tool name (matches outKeysByTool keys).
 			keys := outKeysByTool[call.Name]
 			if len(keys) == 0 {
 				keys = []string{"result"}
@@ -194,10 +167,9 @@ func NestfulHandler(w http.ResponseWriter, r *http.Request, client *bellman.Bell
 
 			b, _ := json.Marshal(out)
 			return string(b), nil
-
 		}
-
 	}
+
 	llm := client.Generator().
 		Model(model).
 		System(req.SystemPrompt).
@@ -217,46 +189,32 @@ func NestfulHandler(w http.ResponseWriter, r *http.Request, client *bellman.Bell
 	case "none":
 		llm = llm.SetToolConfig(tools.NoTool)
 	default:
-		httpErr(w, fmt.Errorf("invalid tool_choice: %q", req.ToolChoice), http.StatusBadRequest)
-		root.RecordError(err)
-		root.SetStatus(codes.Error, err.Error())
+		err := fmt.Errorf("invalid tool_choice: %q", req.ToolChoice)
+		tr.traceError(tr.RootSpan, err)
 		httpErr(w, err, http.StatusBadRequest)
 		return
 	}
 
-	var res *gen.Response
+	tr.startLLMSpan(req, model)
 
-	llmCtx, llmSpan := tracer.Start(ctx, "llm.prompt")
-	llmSpan.SetAttributes(
-		attribute.String("gen_ai.operation.name", "chat"),
-		attribute.String("gen_ai.request.model", fmt.Sprintf("%v/%v", model.Provider, model.Name)),
-		attribute.String("gen_ai.system_instructions", truncate(req.SystemPrompt, 4000)),
-		attribute.String("gen_ai.prompt", truncate(req.Query, 8000)),
-	)
-
-	res, err = llm.Prompt(prompt.AsUser(req.Query))
-	//fmt.Println("LMM resp", res.Tools)
-
-	if err != nil {
-		llmSpan.RecordError(err)
-		llmSpan.SetStatus(codes.Error, err.Error())
-		llmSpan.End()
-	} else {
-		llmSpan.SetAttributes(
-			attribute.Int("gen_ai.usage.input_tokens", res.Metadata.InputTokens),
-			attribute.Int("gen_ai.usage.output_tokens", res.Metadata.OutputTokens),
-			attribute.Int("gen_ai.usage.total_tokens", res.Metadata.TotalTokens),
-		)
-	}
+	res, err := llm.Prompt(prompt.AsUser(req.Query))
+	tr.finishLLMSpan(res, err)
 
 	if err != nil {
 		httpErr(w, fmt.Errorf("upstream error: %w", err), http.StatusBadGateway)
 		return
 	}
 
-	//tracer := otel.Tracer("toolman/nestful")
-	generated, content := nestfulGeneratedText(llmCtx, tracer, res, parsedTools, nameMap, outKeysByTool, req.JSExtractTimeoutMs)
-	llmSpan.End()
+	generated, content := nestfulGeneratedText(
+		tr.LLMCtx,
+		tr,
+		res,
+		parsedTools,
+		nameMap,
+		outKeysByTool,
+		req.JSExtractTimeoutMs,
+	)
+
 	writeJSON(w, http.StatusOK, NestfulBenchmarkResponse{
 		GeneratedText: generated,
 		Content:       content,
@@ -272,17 +230,161 @@ func NestfulHandlerWrapper(client *bellman.Bellman, defaultModelFQN string) http
 	}
 }
 
+func startNestfulTrace(
+	ctx context.Context,
+	req NestfulBenchmarkRequest,
+	sampleID string,
+	choice string,
+	model gen.Model,
+	parsedTools []tools.Tool,
+) *nestfulTrace {
+	t := &nestfulTrace{
+		Tracer: otel.Tracer("toolman/nestful"),
+	}
+
+	t.RootCtx, t.RootSpan = t.Tracer.Start(ctx, "nestful.request")
+	t.RootSpan.SetAttributes(
+		attribute.String("benchmark.name", "nestful"),
+		attribute.String("benchmark.sample_id", sampleID),
+		attribute.Bool("ptc.enabled", req.EnablePTC),
+		attribute.String("tool.choice", choice),
+		attribute.String("gen_ai.request.model", fmt.Sprintf("%v/%v", model.Provider, model.Name)),
+		attribute.Int("gen_ai.tools.count", len(parsedTools)),
+		attribute.String("gen_ai.tools.digest", toolsDigest(req.Tools)),
+	)
+
+	if len(parsedTools) <= 50 {
+		names := make([]string, 0, len(parsedTools))
+		for _, tool := range parsedTools {
+			names = append(names, tool.Name)
+		}
+		t.RootSpan.SetAttributes(
+			attribute.String("gen_ai.tools.names", strings.Join(names, ",")),
+		)
+	}
+
+	return t
+}
+
+func (t *nestfulTrace) startLLMSpan(req NestfulBenchmarkRequest, model gen.Model) {
+	t.LLMCtx, t.LLMSpan = t.Tracer.Start(t.RootCtx, "llm.prompt")
+	t.LLMSpan.SetAttributes(
+		attribute.String("gen_ai.operation.name", "chat"),
+		attribute.String("gen_ai.request.model", fmt.Sprintf("%v/%v", model.Provider, model.Name)),
+		attribute.String("gen_ai.system_instructions", truncate(req.SystemPrompt, 4000)),
+		attribute.String("gen_ai.prompt", truncate(req.Query, 8000)),
+	)
+}
+
+func (t *nestfulTrace) finishLLMSpan(res *gen.Response, err error) {
+	if t.LLMSpan == nil {
+		return
+	}
+
+	if err != nil {
+		t.LLMSpan.RecordError(err)
+		t.LLMSpan.SetStatus(codes.Error, err.Error())
+		t.LLMSpan.End()
+		return
+	}
+
+	if res != nil {
+		if res.IsText() {
+			txt, _ := res.AsText()
+			outJSON, _ := json.Marshal(txt)
+			t.LLMSpan.SetAttributes(
+				attribute.String("gen_ai.completion", string(outJSON)),
+			)
+		} else {
+			outJSON, _ := json.Marshal(res.Tools)
+			t.LLMSpan.SetAttributes(
+				attribute.String("gen_ai.completion", string(outJSON)),
+			)
+		}
+
+		t.LLMSpan.SetAttributes(
+			attribute.Int("gen_ai.usage.input_tokens", res.Metadata.InputTokens),
+			attribute.Int("gen_ai.usage.output_tokens", res.Metadata.OutputTokens),
+			attribute.Int("gen_ai.usage.total_tokens", res.Metadata.TotalTokens),
+		)
+	}
+
+	t.LLMSpan.End()
+}
+
+func (t *nestfulTrace) traceToolCall(ctx context.Context, name string, args map[string]any, index int) {
+	_, span := t.Tracer.Start(ctx, fmt.Sprintf("tool.call %s", name),
+		trace.WithAttributes(
+			attribute.String("gen_ai.operation.name", "execute_tool"),
+			attribute.String("gen_ai.tool.name", name),
+			attribute.String("gen_ai.tool.call.arguments", string(mustJSON(args))),
+			attribute.Int("index", index),
+		),
+	)
+	span.End()
+}
+
+func (t *nestfulTrace) startExecSpan(ctx context.Context, guarded string, timeoutMs int) (context.Context, trace.Span) {
+	execCtx, execSpan := t.Tracer.Start(ctx, "exec.goja")
+	execSpan.SetAttributes(
+		attribute.String("exec.language", "javascript"),
+		attribute.Int("exec.script_len", len(guarded)),
+		attribute.Int("exec.timeout_ms", timeoutMs),
+		attribute.String("exec.script.trunc", truncate(guarded, 4000)),
+	)
+	return execCtx, execSpan
+}
+
+func (t *nestfulTrace) finishExecSpan(execSpan trace.Span, captured []map[string]any, runErr error) {
+	if execSpan == nil {
+		return
+	}
+
+	if runErr != nil {
+		execSpan.RecordError(runErr)
+		execSpan.SetStatus(codes.Error, runErr.Error())
+		execSpan.End()
+		return
+	}
+
+	execSpan.SetAttributes(
+		attribute.String("output.value", "ok"),
+		attribute.Int("captured.tool_calls", len(captured)),
+		attribute.String("captured.json", string(mustJSON(captured))),
+	)
+	execSpan.End()
+}
+
+func (t *nestfulTrace) traceExecToolCall(ctx context.Context, toolName string, args map[string]any, index int) {
+	_, span := t.Tracer.Start(ctx, fmt.Sprintf("tool.call %s", toolName),
+		trace.WithAttributes(
+			attribute.String("gen_ai.operation.name", "execute_tool"),
+			attribute.String("gen_ai.tool.name", toolName),
+			attribute.String("gen_ai.tool.call.arguments", string(mustJSON(args))),
+			attribute.Int("index", index),
+		),
+	)
+	span.End()
+}
+
+func (t *nestfulTrace) traceError(span trace.Span, err error) {
+	if span != nil && err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+}
+
 func parseNestfulTools(raw []any) ([]tools.Tool, map[string]string, map[string][]string, error) {
-	// nameMap: sanitized -> original
 	nameMap := map[string]string{}
-	// outKeysByTool: sanitized tool name -> sorted output keys
 	outKeysByTool := map[string][]string{}
 	parsed := make([]tools.Tool, 0, len(raw))
+
 	for _, rt := range raw {
 		b, err := json.Marshal(rt)
 		if err != nil {
 			return nil, nil, nil, err
 		}
+
 		var def nestfulToolDef
 		if err := json.Unmarshal(b, &def); err != nil {
 			return nil, nil, nil, err
@@ -290,6 +392,7 @@ func parseNestfulTools(raw []any) ([]tools.Tool, map[string]string, map[string][
 		if strings.TrimSpace(def.Name) == "" {
 			continue
 		}
+
 		orig := def.Name
 		sanitized := invalidNameChars.ReplaceAllString(orig, "_")
 		nameMap[sanitized] = orig
@@ -319,8 +422,7 @@ func parseNestfulTools(raw []any) ([]tools.Tool, map[string]string, map[string][
 				required = append(required, k)
 			}
 		}
-		// NESTFUL tool specs often omit explicit per-parameter required flags.
-		// Default to requiring *all* parameters when none are marked required.
+
 		if len(required) == 0 {
 			required = make([]string, 0, len(s.Properties))
 			for k := range s.Properties {
@@ -341,13 +443,23 @@ func parseNestfulTools(raw []any) ([]tools.Tool, map[string]string, map[string][
 	return parsed, nameMap, outKeysByTool, nil
 }
 
-func nestfulGeneratedText(ctx context.Context, tracer trace.Tracer, res *gen.Response, availableTools []tools.Tool, nameMap map[string]string, outKeysByTool map[string][]string, timeoutMs int) (generated string, content string) {
+func nestfulGeneratedText(
+	ctx context.Context,
+	tr *nestfulTrace,
+	res *gen.Response,
+	availableTools []tools.Tool,
+	nameMap map[string]string,
+	outKeysByTool map[string][]string,
+	timeoutMs int,
+) (generated string, content string) {
 	if !res.IsTools() {
 		text, _ := res.AsText()
 		return "[]", text
 	}
+
 	out := make([]map[string]any, 0)
 	errMsgs := make([]string, 0, 1)
+
 	for i, tc := range res.Tools {
 		if tc.Name == "code_execution" {
 			var codeArgs struct {
@@ -357,7 +469,8 @@ func nestfulGeneratedText(ctx context.Context, tracer trace.Tracer, res *gen.Res
 				errMsgs = append(errMsgs, fmt.Sprintf("code_execution args unmarshal error: %v", err))
 				continue
 			}
-			seq, errMsg := executeAndExtractNestful(ctx, tracer, codeArgs.Code, availableTools, outKeysByTool, timeoutMs)
+
+			seq, errMsg := executeAndExtractNestful(ctx, tr, codeArgs.Code, availableTools, outKeysByTool, timeoutMs)
 			if errMsg != "" {
 				errMsgs = append(errMsgs, errMsg)
 			}
@@ -374,29 +487,26 @@ func nestfulGeneratedText(ctx context.Context, tracer trace.Tracer, res *gen.Res
 
 		args := map[string]any{}
 		_ = json.Unmarshal(tc.Argument, &args)
-		_, toolSpan := tracer.Start(ctx, fmt.Sprintf("tool.call %s", tc.Name),
-			trace.WithAttributes(
-				attribute.String("gen_ai.tool.name", tc.Name),
-				attribute.String("gen_ai.tool.call.arguments", string(mustJSON(args))),
-				attribute.Int("index", i+1),
-			),
-		)
-		toolSpan.End()
+
+		tr.traceToolCall(ctx, tc.Name, args, i+1)
+
 		name := tc.Name
 		if orig, ok := nameMap[name]; ok {
 			name = orig
 		}
 		out = append(out, map[string]any{"name": name, "arguments": args})
 	}
+
 	for i := range out {
 		out[i]["label"] = fmt.Sprintf("$var_%d", i+1)
 	}
+
 	return string(mustJSON(out)), strings.Join(errMsgs, "\n")
 }
 
 func executeAndExtractNestful(
 	ctx context.Context,
-	tracer trace.Tracer,
+	tr *nestfulTrace,
 	jsCode string,
 	availableTools []tools.Tool,
 	outKeysByTool map[string][]string,
@@ -418,19 +528,10 @@ func executeAndExtractNestful(
 	})
 	defer timer.Stop()
 
-	execCtx, execSpan := tracer.Start(ctx, "exec.goja")
-	execSpan.SetAttributes(
-		attribute.String("exec.language", "javascript"),
-		attribute.Int("exec.script_len", len(guarded)),
-		//attribute.String("input.value", guarded),
-		attribute.Int("exec.timeout_ms", timeoutMs),
-		attribute.String("exec.script.trunc", truncate(guarded, 4000)),
-	)
+	execCtx, execSpan := tr.startExecSpan(ctx, guarded, timeoutMs)
 
-	defer execSpan.End()
-
-	for _, t := range availableTools {
-		tName := t.Name
+	for _, tool := range availableTools {
+		tName := tool.Name
 		keys := outKeysByTool[tName]
 		if len(keys) == 0 {
 			keys = []string{"result"}
@@ -444,7 +545,6 @@ func executeAndExtractNestful(
 				outObj[k] = fmt.Sprintf("$var_%d.%s$", idx, k)
 			}
 
-			// Extract args from JS call.
 			argsMap := make(map[string]any)
 			if len(call.Arguments) > 0 {
 				first := call.Arguments[0].Export()
@@ -459,39 +559,28 @@ func executeAndExtractNestful(
 					}
 				}
 			}
+
 			normalizeVarRefs(argsMap)
 			captured = append(captured, map[string]any{
 				"name":      tName,
 				"arguments": argsMap,
 			})
 
-			_, toolSpan := tracer.Start(execCtx, fmt.Sprintf("tool.call %s", tName), trace.WithAttributes(
-				attribute.String("gen_ai.operation.name", "execute_tool"),
-				attribute.String("gen_ai.tool.name", tName),
-				attribute.String("gen_ai.tool.call.arguments", string(mustJSON(argsMap))),
-				attribute.Int("index", len(captured)),
-			))
-			toolSpan.End()
-
+			tr.traceExecToolCall(execCtx, tName, argsMap, len(captured))
 			return vm.ToValue(outObj)
 		}
 
 		_ = vm.Set(tName, interceptor)
 	}
 
-	if _, runErr := vm.RunString(guarded); runErr != nil {
-		execSpan.RecordError(runErr)
-		execSpan.SetStatus(codes.Error, runErr.Error())
-		//return fmt.Sprintf(`{"error": %q}`, runErr), "nil"
+	_, runErr := vm.RunString(guarded)
+	tr.finishExecSpan(execSpan, captured, runErr)
+
+	if runErr != nil {
 		return captured, fmt.Sprintf("code_execution run error: %v", runErr)
 	}
 
-	execSpan.SetAttributes(
-		attribute.String("output.vlue", "ok"),
-		attribute.Int("captured.tool_calls", len(captured)),
-		attribute.String("captured.json", string(mustJSON(captured))),
-	)
-
+	_ = meta
 	return captured, ""
 }
 
@@ -600,7 +689,6 @@ func applyTypeFromString(js *schema.JSON, t string) {
 	case ls == "string":
 		js.Type = schema.String
 	default:
-		// leave empty (permissive)
 	}
 }
 
@@ -629,12 +717,12 @@ func parseModelFQN(fqn string) (gen.Model, error) {
 		return gen.Model{}, fmt.Errorf("expected provider/name (or provider.name), got %q", fqn)
 	}
 	provider = canonicalProvider(provider)
-	//name = canonicalModelName(name)
 	if provider == "" || name == "" {
 		return gen.Model{}, fmt.Errorf("expected provider/name (or provider.name), got %q", fqn)
 	}
 	return gen.Model{Provider: provider, Name: name}, nil
 }
+
 func canonicalProvider(p string) string {
 	pl := strings.ToLower(strings.TrimSpace(p))
 	switch pl {
@@ -671,27 +759,25 @@ func setupHttpLangfuse(ctx context.Context) (*sdktrace.TracerProvider, error) {
 	secKey := os.Getenv("LANGFUSE_SECRET_KEY")
 	host := os.Getenv("LANGFUSE_BASE_URL")
 	fmt.Println("host:", host)
+
 	if pubKey == "" || secKey == "" || host == "" {
-		fmt.Errorf("Missing LANGFUSE_PUBLIC_KEY or LANGFUSE_SECRET_KEY in .env")
+		return nil, fmt.Errorf("missing LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY or LANGFUSE_BASE_URL in .env")
 	}
 
-	// Base64 encode for Basic Auth
 	auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", pubKey, secKey)))
 
-	// Configure the HTTP Exporter directly to your local Docker container
 	exporter, err := otlptracehttp.New(ctx,
 		otlptracehttp.WithEndpoint(host),
 		otlptracehttp.WithURLPath("/api/public/otel/v1/traces"),
-		otlptracehttp.WithInsecure(), // REQUIRED for localhost testing without HTTPS!
+		otlptracehttp.WithInsecure(),
 		otlptracehttp.WithHeaders(map[string]string{
 			"Authorization": "Basic " + auth,
 		}),
 	)
 	if err != nil {
-		fmt.Errorf("Failed to create HTTP exporter: %v", err)
+		return nil, fmt.Errorf("failed to create HTTP exporter: %w", err)
 	}
 
-	// Create the Tracer Provider
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(resource.NewWithAttributes(
