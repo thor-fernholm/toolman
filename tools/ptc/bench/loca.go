@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dop251/goja"
@@ -665,15 +666,17 @@ func HandleGenerateLOCA(w http.ResponseWriter, r *http.Request) {
 
 	// Help the model avoid sandbox path errors by discovering the allowed
 	// workspace root and injecting it into the system prompt.
-	injectAllowedWorkspaceRootLOCA(ctx, mcp, reg, &req)
+	allowedRoot := injectAllowedWorkspaceRootLOCA(ctx, mcp, reg, &req)
 
 	if req.EnablePTC {
-		trace, ptcCode, final, hist, inTok, outTok, err := runLOCAPTC(ctx, bClient, mcp, reg, req)
+		trace, ptcCode, final, hist, inTok, outTok, err := runLOCAPTC(ctx, bClient, mcp, reg, req, allowedRoot)
 		writeLOCAResponse(w, start, trace, hist, ptcCode, final, inTok, outTok, err)
 		return
 	}
 
-	trace, final, hist, inTok, outTok, err := runLOCANormal(ctx, bClient, mcp, reg, req)
+	trace, final, hist, inTok, outTok, err := runLOCANormal(ctx, bClient, mcp, reg, req, allowedRoot)
+	fmt.Println("Input tokens ", inTok)
+	fmt.Println("Output tokens ", outTok)
 	writeLOCAResponse(w, start, trace, hist, "", final, inTok, outTok, err)
 }
 
@@ -695,26 +698,108 @@ func normalizeModelParamsLOCA(req *locaRequest) {
 	}
 }
 
-func injectAllowedWorkspaceRootLOCA(ctx context.Context, mcp *mcpClient, reg *toolRegistry, req *locaRequest) {
+func injectAllowedWorkspaceRootLOCA(ctx context.Context, mcp *mcpClient, reg *toolRegistry, req *locaRequest) string {
 	if mcp == nil || reg == nil || req == nil {
-		return
+		return ""
 	}
 
 	serverURL, ok := findMCPServerForOrigToolLOCA(reg, "list_allowed_directories")
 	if !ok {
 		// Fall back to instruction-only.
 		appendWorkspacePathInstructionLOCA(req, "")
-		return
+		return ""
 	}
 
 	out, err := mcp.CallTool(ctx, serverURL, "list_allowed_directories", map[string]any{})
 	if err != nil {
 		appendWorkspacePathInstructionLOCA(req, "")
-		return
+		return ""
 	}
 
 	root := extractFirstWindowsPathLOCA(out)
 	appendWorkspacePathInstructionLOCA(req, root)
+	return root
+}
+
+func rewriteCSVPathArgsLOCA(args map[string]any, allowedRoot string) map[string]any {
+	// Backwards-compatible shim; keep name but apply a recursive rewrite.
+	if args == nil {
+		return args
+	}
+	out, ok := rewriteCSVPathsAnyLOCA(args, allowedRoot).(map[string]any)
+	if !ok {
+		return args
+	}
+	return out
+}
+
+func rewriteCSVPathsAnyLOCA(v any, allowedRoot string) any {
+	root := strings.TrimSpace(allowedRoot)
+	if root == "" {
+		return v
+	}
+	root = strings.TrimRight(root, "\\/")
+
+	// Only rewrite values that are very likely to be file paths.
+	pathKeys := map[string]bool{
+		"path":      true,
+		"file_path": true,
+		"filepath":  true,
+		"filePath":  true,
+		"filename":  true,
+		"file":      true,
+	}
+
+	switch vv := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(vv))
+		for k, val := range vv {
+			// Recurse by default.
+			newVal := rewriteCSVPathsAnyLOCA(val, root)
+			// Additionally rewrite known path-like keys when the value is a string.
+			if pathKeys[k] {
+				if s, ok := val.(string); ok {
+					if rewritten, ok2 := rewriteCSVPathStringLOCA(s, root); ok2 {
+						newVal = rewritten
+					}
+				}
+			}
+			out[k] = newVal
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(vv))
+		for _, it := range vv {
+			out = append(out, rewriteCSVPathsAnyLOCA(it, root))
+		}
+		return out
+	case string:
+		// Only rewrite bare strings if they *look* like a file path.
+		if rewritten, ok := rewriteCSVPathStringLOCA(vv, root); ok {
+			return rewritten
+		}
+		return vv
+	default:
+		return v
+	}
+}
+
+func rewriteCSVPathStringLOCA(s string, root string) (string, bool) {
+	p := strings.TrimSpace(s)
+	if p == "" {
+		return s, false
+	}
+	base := p
+	if i := strings.LastIndexAny(base, "\\/"); i >= 0 {
+		base = base[i+1:]
+	}
+	bn := strings.ToLower(strings.TrimSpace(base))
+	if bn != "assignment_info.csv" && bn != "quiz_info.csv" {
+		return s, false
+	}
+	// If it is just a filename or a path, force it into the allowed root.
+	// Keep original base casing.
+	return root + "\\" + base, true
 }
 
 func findMCPServerForOrigToolLOCA(reg *toolRegistry, origToolName string) (string, bool) {
@@ -868,7 +953,7 @@ func toolChoiceToConfig(choice string, toolMap map[string]tools.Tool) (*tools.To
 	}
 }
 
-func runLOCANormal(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, reg *toolRegistry, req locaRequest) ([]locaTraceCall, any, []prompt.Prompt, int, int, error) {
+func runLOCANormal(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, reg *toolRegistry, req locaRequest, allowedRoot string) ([]locaTraceCall, any, []prompt.Prompt, int, int, error) {
 	model, err := gen.ToModel(req.BellmanModel)
 	if err != nil {
 		return nil, nil, nil, 0, 0, err
@@ -895,6 +980,7 @@ func runLOCANormal(ctx context.Context, client *bellman.Bellman, mcp *mcpClient,
 			if err := json.Unmarshal(call.Argument, &args); err != nil {
 				args = map[string]any{}
 			}
+			args = rewriteCSVPathArgsLOCA(args, allowedRoot)
 			traceMu.Lock()
 			trace = append(trace, locaTraceCall{Name: orig, Arguments: args})
 			traceMu.Unlock()
@@ -911,6 +997,7 @@ func runLOCANormal(ctx context.Context, client *bellman.Bellman, mcp *mcpClient,
 			}
 
 			out, err := mcp.CallTool(ctx, serverURL, orig, args)
+			//fmt.Println("out", out)
 			if err != nil {
 				return "", err
 			}
@@ -1006,7 +1093,7 @@ func toolCacheKeyLOCA(serverURL, toolName string, args map[string]any) string {
 	return serverURL + "|" + toolName + "|" + string(b)
 }
 
-func runLOCAPTC(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, reg *toolRegistry, req locaRequest) ([]locaTraceCall, string, any, []prompt.Prompt, int, int, error) {
+func runLOCAPTC(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, reg *toolRegistry, req locaRequest, allowedRoot string) ([]locaTraceCall, string, any, []prompt.Prompt, int, int, error) {
 	model, err := gen.ToModel(req.BellmanModel)
 	if err != nil {
 		return nil, "", nil, nil, 0, 0, err
@@ -1020,9 +1107,80 @@ func runLOCAPTC(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, re
 	ptcCache := map[string]any{}
 	var ptcCacheMu sync.Mutex
 
+	// Build a persistent JS runtime for this request so state can survive across turns.
+	vm := goja.New()
+	var vmMu sync.Mutex
+	jsToolNames := make([]string, 0, len(reg.Tools))
+
+	// Bind each MCP tool as a global JS function (once per request).
+	for _, t := range reg.Tools {
+		name := t.Name
+		serverURL := reg.ToolNameToURL[name]
+		orig := reg.ToolNameToOrig[name]
+		jsName := name
+		// Avoid accidental collisions with the meta-tool name.
+		if jsName == "code_execution" {
+			jsName = "mcp_" + jsName
+		}
+		jsToolNames = append(jsToolNames, jsName)
+		_ = vm.Set(jsName, func(fc goja.FunctionCall) goja.Value {
+			// Enforce a single object argument (common LLM mistake: multiple args).
+			if len(fc.Arguments) > 1 {
+				return vm.ToValue(map[string]any{
+					"ok":    false,
+					"error": fmt.Sprintf("%s expects exactly one object argument", jsName),
+				})
+			}
+
+			var args map[string]any
+			if len(fc.Arguments) == 1 {
+				exp := fc.Arguments[0].Export()
+				m, ok := exp.(map[string]any)
+				if ok {
+					args = m
+				} else {
+					args = map[string]any{}
+				}
+			} else {
+				args = map[string]any{}
+			}
+
+			// If the model tries common wrong roots for the two CSV files, rewrite to the
+			// allowed workspace root so we don't spam access-denied calls.
+			args = rewriteCSVPathArgsLOCA(args, allowedRoot)
+
+			traceMu.Lock()
+			trace = append(trace, locaTraceCall{Name: orig, Arguments: args})
+			traceMu.Unlock()
+
+			if isCacheableToolLOCA(orig) {
+				key := toolCacheKeyLOCA(serverURL, orig, args)
+				ptcCacheMu.Lock()
+				cached, ok := ptcCache[key]
+				ptcCacheMu.Unlock()
+				if ok {
+					return vm.ToValue(cached)
+				}
+			}
+
+			out, err := mcp.CallTool(ctx, serverURL, orig, args)
+			//fmt.Println("executed tool output: ", out)
+			if err != nil {
+				return vm.ToValue(map[string]any{"ok": false, "error": err.Error()})
+			}
+			if isCacheableToolLOCA(orig) {
+				key := toolCacheKeyLOCA(serverURL, orig, args)
+				ptcCacheMu.Lock()
+				ptcCache[key] = out
+				ptcCacheMu.Unlock()
+			}
+			return vm.ToValue(out)
+		})
+	}
+
 	// Build code_execution tool.
 	codeTool := tools.NewTool("code_execution",
-		tools.WithDescription("Execute a single JavaScript program and return the final value."),
+		tools.WithDescription("Execute top-level JavaScript in a persistent runtime and return the final value as JSON."),
 		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
 			var arg struct {
 				Code string `json:"code"`
@@ -1032,73 +1190,36 @@ func runLOCAPTC(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, re
 			}
 			ptcCode = arg.Code
 
+			guarded, gerr := guardRailJSLOCA(arg.Code)
+			if gerr != nil {
+				// Return as a tool output payload (not an RPC error) so the model can fix its code.
+				b, _ := json.Marshal(map[string]any{"error": gerr.Error()})
+				return string(b), nil
+			}
+
 			timeout := time.Duration(req.TimeoutMS) * time.Millisecond
 			if timeout <= 0 {
 				timeout = 10 * time.Second
 			}
 
-			vm := goja.New()
-			timedOut := false
+			var timedOut int32
 			timer := time.AfterFunc(timeout, func() {
-				timedOut = true
+				atomic.StoreInt32(&timedOut, 1)
 				vm.Interrupt("timeout")
 			})
 			defer timer.Stop()
 
-			// Bind each MCP tool as a global JS function.
-			for _, t := range reg.Tools {
-				name := t.Name
-				serverURL := reg.ToolNameToURL[name]
-				orig := reg.ToolNameToOrig[name]
-				jsName := name
-				_ = vm.Set(jsName, func(fc goja.FunctionCall) goja.Value {
-					var args map[string]any
-					if len(fc.Arguments) > 0 {
-						exp := fc.Arguments[0].Export()
-						m, ok := exp.(map[string]any)
-						if ok {
-							args = m
-						} else {
-							args = map[string]any{}
-						}
-					} else {
-						args = map[string]any{}
-					}
-
-					traceMu.Lock()
-					trace = append(trace, locaTraceCall{Name: orig, Arguments: args})
-					traceMu.Unlock()
-
-					if isCacheableToolLOCA(orig) {
-						key := toolCacheKeyLOCA(serverURL, orig, args)
-						ptcCacheMu.Lock()
-						cached, ok := ptcCache[key]
-						ptcCacheMu.Unlock()
-						if ok {
-							return vm.ToValue(cached)
-						}
-					}
-
-					out, err := mcp.CallTool(ctx, serverURL, orig, args)
-					if err != nil {
-						panic(vm.ToValue(err.Error()))
-					}
-					if isCacheableToolLOCA(orig) {
-						key := toolCacheKeyLOCA(serverURL, orig, args)
-						ptcCacheMu.Lock()
-						ptcCache[key] = out
-						ptcCacheMu.Unlock()
-					}
-					return vm.ToValue(out)
-				})
-			}
-
-			v, err := vm.RunString(arg.Code)
+			// Execute JS in the persistent runtime.
+			vmMu.Lock()
+			v, err := vm.RunString(guarded)
+			vmMu.Unlock()
 			if err != nil {
-				if timedOut {
-					return "", fmt.Errorf("goja timeout after %s", timeout)
+				if atomic.LoadInt32(&timedOut) == 1 {
+					b, _ := json.Marshal(map[string]any{"error": fmt.Sprintf("timeout after %s", timeout)})
+					return string(b), nil
 				}
-				return "", err
+				b, _ := json.Marshal(map[string]any{"error": err.Error()})
+				return string(b), nil
 			}
 			b, err := json.Marshal(v.Export())
 			if err != nil {
@@ -1119,13 +1240,13 @@ func runLOCAPTC(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, re
 	if system != "" {
 		system += "\n\n"
 	}
-	system += locaPTCSystemInstruction(reg)
+	system += locaPTCSystemInstruction(jsToolNames)
 
 	g := client.Generator().
 		Model(model).
 		System(system).
 		SetTools(codeTool).
-		SetToolConfig(tools.RequiredTool).
+		SetToolConfig(tools.AutoTool).
 		WithContext(ctx).
 		Temperature(req.Temperature)
 	if req.MaxTokens > 0 {
@@ -1143,7 +1264,7 @@ func runLOCAPTC(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, re
 		}
 		inTok += res.Metadata.InputTokens
 		outTok += res.Metadata.OutputTokens
-		println("Input token: ", inTok)
+		//fmt.Println("Input token: ", inTok)
 		if res.IsText() {
 			text, _ := res.AsText()
 			hist = append(hist, prompt.AsAssistant(text))
@@ -1152,11 +1273,17 @@ func runLOCAPTC(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, re
 		if !res.IsTools() {
 			return trace, ptcCode, nil, hist, inTok, outTok, nil
 		}
-		for _, c := range res.Tools {
+		for i, c := range res.Tools {
 			hist = append(hist, prompt.AsToolCall(c.ID, c.Name, c.Argument))
+			if i > 0 {
+				// Enforce single tool call per turn: reply to extra calls with an error payload.
+				b, _ := json.Marshal(map[string]any{"error": "only one code_execution call allowed per turn"})
+				hist = append(hist, prompt.AsToolResponse(c.ID, c.Name, string(b)))
+				continue
+			}
 			out, err := codeTool.Function(ctx, c)
 			if err != nil {
-				// still return partial trace + ptc_code
+				// Treat as transport error (rare); still attach tool response for consistency.
 				hist = append(hist, prompt.AsToolResponse(c.ID, c.Name, err.Error()))
 				return trace, ptcCode, nil, hist, inTok, outTok, err
 			}
@@ -1166,18 +1293,37 @@ func runLOCAPTC(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, re
 	return trace, ptcCode, nil, hist, inTok, outTok, fmt.Errorf("max steps reached")
 }
 
-func locaPTCSystemInstruction(reg *toolRegistry) string {
+func guardRailJSLOCA(code string) (string, error) {
+	// Keep this intentionally small but aligned with the bench instruction.
+	if strings.TrimSpace(code) == "" {
+		return code, fmt.Errorf("RuntimeError: No JavaScript code provided")
+	}
+	// Forbid logging: models sometimes attempt to debug via console.
+	if strings.Contains(code, "console.log(") || strings.Contains(code, "print(") || strings.Contains(code, "print( ") {
+		return code, fmt.Errorf("RuntimeError: Logging is forbidden (console.log/print)")
+	}
+	// Forbid async/await: this runtime is synchronous and tool calls are blocking.
+	if strings.Contains(code, "async ") || strings.Contains(code, "await") || strings.Contains(code, "async(") {
+		return code, fmt.Errorf("RuntimeError: Async/await is forbidden")
+	}
+	return code, nil
+}
+
+func locaPTCSystemInstruction(jsToolNames []string) string {
 	var b strings.Builder
 	b.WriteString("You are running a LOCA function-calling benchmark.\n")
-	b.WriteString("You MUST call the tool 'code_execution' exactly once per turn when tools are needed.\n")
-	b.WriteString("In code_execution, output JavaScript wrapped like: (function(){ ...; return <object>; })()\n")
-	b.WriteString("No top-level return. No async/await.\n")
+	b.WriteString("Use the tool 'code_execution' to run JavaScript that calls tools as functions.\n")
+	b.WriteString("If you call tools, you MUST call 'code_execution' exactly once per turn.\n")
+	b.WriteString("In code_execution, write top-level JavaScript. No async/await. No logging (console.log/print).\n")
+	b.WriteString("The tool returns the JSON value of the LAST evaluated expression; end your script with an object like: ({a, b}).\n")
+	b.WriteString("Do NOT use a top-level 'return'.\n")
 	b.WriteString("Call tools as global functions: tool_name({ ... }) with exactly one object argument.\n")
 	b.WriteString("Treat tool outputs as opaque JSON objects; only use fields you see returned.\n")
 	b.WriteString("\nAvailable tool names:\n")
-	for _, t := range reg.Tools {
+	sort.Strings(jsToolNames)
+	for _, n := range jsToolNames {
 		b.WriteString("- ")
-		b.WriteString(t.Name)
+		b.WriteString(n)
 		b.WriteString("\n")
 	}
 	return b.String()
