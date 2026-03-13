@@ -72,10 +72,8 @@ func (c *Cache) HandleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.EnablePTC {
-		// ensure replay cache is ready
-		c.ensureCache(req)
-	}
+	// ensure replay cache is ready
+	c.ensureCache(req)
 
 	c.replayGenerateBFCL(w, req, nil)
 }
@@ -137,7 +135,7 @@ func (c *Cache) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkRequest, 
 
 	// trace llm call start (if not recording already)
 	if c.Tracer.ChatSpan.Span == nil || !c.Tracer.ChatSpan.IsRecording() {
-		c.Tracer.Trace(prompt.AsUser(""), toolmanConversation)
+		c.Tracer.Trace(prompt.AsUser("..."), toolmanConversation)
 	}
 
 	llm := client.Generator().Model(model).
