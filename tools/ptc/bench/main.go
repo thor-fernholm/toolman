@@ -5,33 +5,30 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/joho/godotenv"
-	"github.com/modfin/bellman/tools/ptc/bfcl"
-	"github.com/modfin/bellman/tools/ptc/cfb"
+	"github.com/modfin/bellman/tools/ptc/bench/bfcl"
+	"github.com/modfin/bellman/tools/ptc/bench/cfb"
+	"github.com/modfin/bellman/tools/ptc/bench/nestful"
+	"github.com/modfin/bellman/tools/ptc/bench/replay"
+	"github.com/modfin/bellman/tools/ptc/bench/tracer"
 )
 
 func main() {
-	// godotenv.Load() ...
-	if err := godotenv.Load(); err != nil {
-		log.Printf("warning: failed to load .env: %v", err)
-	}
+	// Create persistent cache and inject into handlers
+	bfclCache := bfcl.NewCache()
+	cfbCache := &cfb.Cache{Replay: replay.NewReplay(), Tracer: tracer.NewTracer("ComplexFuncBench")}
 
 	// Register API Endpoint
-	http.HandleFunc("/bfcl", MiddlewareDebugLogger("BFCL", bfcl.HandleGenerateBFCL))
+	http.HandleFunc("/bfcl", bfclCache.HandleGenerateBFCL)
+	http.HandleFunc("/cfb", cfbCache.HandleGenerateCFB)
+	http.HandleFunc("/nestful", nestful.NesfulHandlerFromEnv())
 	http.HandleFunc("/loca", HandleGenerateLOCA)
-	http.HandleFunc("/cfb", MiddlewareDebugLogger("CFB", cfb.HandleGenerateCFB))
-
-	// Register Debug UI Endpoints
-	http.HandleFunc("/debug", HandleDebugUI)
-	http.HandleFunc("/debug/api/data", HandleDebugData)
-	http.HandleFunc("/debug/api/clear", HandleDebugClear)
 
 	fmt.Println("---------------------------------------------------------")
 	fmt.Println(" Toolman Bench Server Running")
-	fmt.Println(" BFCL API Endpoint:   http://localhost:8080/bfcl")
+	fmt.Println(" BFCL API Endpoint:   		http://localhost:8080/bfcl")
+	fmt.Println(" CFB API Endpoint:    		http://localhost:8080/cfb")
+	fmt.Println(" NESTFUL API Endpoint:    	http://localhost:8080/nestful")
 	fmt.Println(" LOCA API Endpoint:   http://localhost:8080/loca")
-	fmt.Println(" CFB API Endpoint:    http://localhost:8080/cfb")
-	fmt.Println(" BFCL Debug UI:       http://localhost:8080/debug")
 	fmt.Println("---------------------------------------------------------")
 
 	fmt.Println("Toolman Benchmark Server running on :8080")

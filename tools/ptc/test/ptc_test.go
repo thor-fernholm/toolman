@@ -1,15 +1,18 @@
-package bellman
+package test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/dop251/goja"
 	"github.com/joho/godotenv"
+	"github.com/modfin/bellman"
 	"github.com/modfin/bellman/agent"
 	"github.com/modfin/bellman/models/embed"
 	"github.com/modfin/bellman/models/gen"
@@ -20,32 +23,235 @@ import (
 	"github.com/modfin/bellman/tools"
 	"github.com/modfin/bellman/tools/ptc"
 	"github.com/wizenheimer/comet"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
-func TestToolman(t *testing.T) {
+func TestOpenTelemetry(t *testing.T) {
 	// get env vars
-	err := godotenv.Load()
+	err := godotenv.Load("../../../.env")
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
 	bellmanUrl := os.Getenv("BELLMAN_URL")
 	bellmanToken := os.Getenv("BELLMAN_TOKEN")
 
-	allTools := ptc.GetMockBellmanTools(true)
-	models := []gen.Model{openai.GenModel_gpt4o_mini, vertexai.GenModel_gemini_2_5_flash_latest, anthropic.GenModel_3_haiku_20240307}
-	//models = []gen.Model{openai.GenModel_gpt4o_mini}
+	ctx := context.Background()
+
+	system := "# Role\nYou are a helpful LLM assistant."
+
+	// init tracer
+	tp := setupHttpLangfuse(ctx, t)
+	// Ensure traces are flushed to Docker container before test ends!
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tp.Shutdown(shutdownCtx); err != nil {
+			t.Errorf("Error shutting down tracer: %v", err)
+		}
+	}()
+	tracer := otel.Tracer("test-suite")
+	// Create the PARENT Span. This represents the entire conversational session.
+	// By reassigning to 'ctx', all future spans will become children of this trace.
+	ctx, parentSpan := tracer.Start(ctx, "Agent_Session")
+	defer parentSpan.End()
+	// Optionally, tag the parent trace with a Langfuse Session ID
+	// to group multiple disjointed traces together in their UI!
+	parentSpan.SetAttributes(
+		attribute.String("langfuse.session.id", "session-12345"),
+		attribute.String("gen_ai.system_instructions", system),
+	)
+
+	enablePTC := true
+	allTools := GetMockBellmanTools(enablePTC)
+	model := openai.GenModel_gpt5_mini_latest
 
 	// create Bellman llm and run agent
-	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
+	client := bellman.New(bellmanUrl, bellman.Key{Name: "test", Token: bellmanToken})
+	llm := client.Generator().System(system).Model(model).
+		SetTools(allTools...).ThinkingBudget(100) //.Temperature(0)
+
+	if enablePTC {
+		llm, _ = llm.ActivatePTC(ptc.JavaScript)
+	}
+
+	userPrompt := "1. Do you know what PTC is (programmatic tool calling), and how LLMs call tools? If yes; answer me which tool at your disposal is PTC. If no; why not?"
+	userPrompt += "2. Predict the future, 3. convert 69 usd to sek, and then 4. generate a secret password. "
+	userPrompt += "also, 5. get me the stock info (price/details) for saab, ericsson, and telia."
+
+	// stopwatch
+	start := time.Now()
+
+	var res *agent.Result[Result]
+	switch llm.Request.Model.Provider {
+	case vertexai.Provider:
+		res, err = agent.RunWithToolsOnly[Result](10, 0, llm, prompt.AsUser(userPrompt))
+	default:
+		res, err = agent.Run[Result](10, 0, llm, prompt.AsUser(userPrompt))
+	}
+
+	// start tracing in res loop
+	if err != nil {
+		log.Printf("Prompt() error = %v", err)
+	} else {
+		var activeLLMSpan trace.Span
+		var activeToolSpan trace.Span
+		// create a time cursor to simulate latency (for UI demo)
+		cursorTime := start
+
+		for i, m := range res.Prompts {
+			fmt.Printf("prompt %v: { role: %v, text: %v, tool_call: %v, tool_response: %v }\n", i, m.Role, m.Text, m.ToolCall, m.ToolResponse)
+
+			// add spans to trace
+			switch m.Role {
+			case prompt.UserRole:
+				_, activeLLMSpan = tracer.Start(ctx, fmt.Sprintf("chat %s", model.Name), trace.WithTimestamp(cursorTime))
+				activeLLMSpan.SetAttributes(
+					attribute.String("gen_ai.operation.name", "chat"),
+					attribute.String("gen_ai.provider.name", model.Provider),
+					attribute.String("gen_ai.request.model", model.Name),
+					attribute.String("gen_ai.prompt", m.Text),
+				)
+				cursorTime = cursorTime.Add(100 * time.Millisecond)
+			case prompt.AssistantRole:
+				activeLLMSpan.SetAttributes(
+					attribute.String("gen_ai.completion", m.Text),
+				)
+				activeLLMSpan.End(trace.WithTimestamp(cursorTime)) // Close the LLM span
+				cursorTime = cursorTime.Add(100 * time.Millisecond)
+			case prompt.ToolCallRole:
+				activeLLMSpan.SetAttributes(
+					attribute.String("gen_ai.completion", fmt.Sprintf("Tool Call Requested: %v", m.ToolCall.Name)),
+				)
+				activeLLMSpan.End(trace.WithTimestamp(cursorTime)) // Close the LLM span
+
+				// Immediately open a Tool Span!
+				_, activeToolSpan = tracer.Start(ctx, fmt.Sprintf("execute_tool %s", m.ToolCall.Name), trace.WithTimestamp(cursorTime))
+				activeToolSpan.SetAttributes(
+					attribute.String("gen_ai.operation.name", "execute_tool"),
+					attribute.String("gen_ai.tool.name", m.ToolCall.Name),
+					attribute.String("gen_ai.tool.call.arguments", string(m.ToolCall.Arguments)),
+					attribute.String("gen_ai.tool.call.id", m.ToolCall.ToolCallID),
+				)
+				cursorTime = cursorTime.Add(100 * time.Millisecond)
+			case prompt.ToolResponseRole:
+				if activeToolSpan != nil {
+					// The tool finished executing! Log the result and close the span.
+					activeToolSpan.SetAttributes(
+						//attribute.String("gen_ai.tool.name", m.ToolResponse.Name),
+						attribute.String("gen_ai.tool.call.result", m.ToolResponse.Response),
+						//attribute.String("gen_ai.tool.call.id", m.ToolResponse.ToolCallID),
+						//attribute.String("output.value", m.ToolResponse.Response),
+					)
+					activeToolSpan.End(trace.WithTimestamp(cursorTime))
+				}
+				cursorTime = cursorTime.Add(100 * time.Millisecond)
+				// Start the next LLM span to capture the LLM digesting the tool output!
+				_, activeLLMSpan = tracer.Start(ctx, fmt.Sprintf("chat %s", model.Name), trace.WithTimestamp(cursorTime))
+				activeLLMSpan.SetAttributes(
+					attribute.String("gen_ai.operation.name", "chat"),
+					attribute.String("gen_ai.prompt", fmt.Sprintf("Tool Result: %v", m.ToolResponse.Response)),
+					attribute.String("gen_ai.provider.name", model.Provider),
+					attribute.String("gen_ai.request.model", model.Name),
+				)
+				cursorTime = cursorTime.Add(100 * time.Millisecond)
+			}
+		}
+
+		if activeLLMSpan != nil && activeLLMSpan.IsRecording() {
+			activeLLMSpan.SetAttributes(
+				attribute.String("gen_ai.completion", res.Result.Text),
+				attribute.Int("gen_ai.usage.input_tokens", res.Metadata.InputTokens),
+				attribute.Int("gen_ai.usage.output_tokens", res.Metadata.OutputTokens),
+			)
+			activeLLMSpan.End(trace.WithTimestamp(cursorTime))
+		}
+		if activeToolSpan != nil && activeToolSpan.IsRecording() {
+			activeToolSpan.End(trace.WithTimestamp(cursorTime))
+		}
+
+		// pretty print
+		prettyPrint(res)
+		elapsed := time.Since(start)
+		fmt.Printf("Prompt took %s", elapsed)
+	}
+}
+
+// setupHttpLangfuse reads the .env and wires a direct HTTP connection to localhost:3000
+func setupHttpLangfuse(ctx context.Context, t *testing.T) *sdktrace.TracerProvider {
+	// Load the keys
+	pubKey := os.Getenv("LANGFUSE_PUBLIC_KEY")
+	secKey := os.Getenv("LANGFUSE_SECRET_KEY")
+	host := os.Getenv("LANGFUSE_BASE_URL")
+	if pubKey == "" || secKey == "" {
+		t.Fatal("Missing LANGFUSE_PUBLIC_KEY or LANGFUSE_SECRET_KEY in .env")
+	}
+
+	// Base64 encode for Basic Auth
+	auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", pubKey, secKey)))
+
+	// Configure the HTTP Exporter directly to your local Docker container
+	exporter, err := otlptracehttp.New(ctx,
+		otlptracehttp.WithEndpoint(host),
+		otlptracehttp.WithURLPath("/api/public/otel/v1/traces"),
+		otlptracehttp.WithInsecure(), // REQUIRED for localhost testing without HTTPS!
+		otlptracehttp.WithHeaders(map[string]string{
+			"Authorization": "Basic " + auth,
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create HTTP exporter: %v", err)
+	}
+
+	// Create the Tracer Provider
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName("langfuse-ping-test"),
+		)),
+	)
+	otel.SetTracerProvider(tp)
+	return tp
+}
+
+func TestToolman(t *testing.T) {
+	// get env vars
+	err := godotenv.Load("../../../.env")
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+	bellmanUrl := os.Getenv("BELLMAN_URL")
+	bellmanToken := os.Getenv("BELLMAN_TOKEN")
+
+	enablePTC := true
+	allTools := GetMockBellmanTools(enablePTC)
+	models := []gen.Model{openai.GenModel_gpt4o_mini, vertexai.GenModel_gemini_2_5_flash_latest, anthropic.GenModel_3_haiku_20240307}
+	models = []gen.Model{openai.GenModel_gpt5_mini_latest}
+
+	// create Bellman llm and run agent
+	client := bellman.New(bellmanUrl, bellman.Key{Name: "test", Token: bellmanToken})
 	llm := client.Generator().System("# Role\nYou are a helpful LLM assistant.").
-		SetTools(allTools...).SetPTCLanguage(tools.JavaScript).Temperature(0)
+		SetTools(allTools...).ThinkingBudget(100) //.Temperature(0)
+
+	if enablePTC {
+		llm, _ = llm.ActivatePTC(ptc.JavaScript)
+	}
 
 	userPrompt := "1. Do you know what PTC is (programmatic tool calling), and how LLMs call tools? If yes; answer me which tool at your disposal is PTC. If no; why not?"
 	userPrompt += "2. Predict the future, 3. convert 69 usd to sek, and then 4. generate a secret password. "
 	//userPrompt += "Also, solve this problem: " + "Find the integer between 1 and 1,000 that produces the longest Collatz sequence. " +
 	//	"Rules:\n 1. Start with any number n.\n 2. If n is even, divide by 2.\n 3. If n is odd, multiply by 3 and add 1.\n 4. Repeat until n becomes 1." +
 	//	"\nReturn the starting number and the length of its sequence."
-	userPrompt += "also, 5. get me the stock info for saab, ericsson."
+	userPrompt += "also, 5. get me the stock info (price/details) for saab, ericsson, and telia."
+
+	// stopwatch
+	start := time.Now()
 
 	// run all models
 	for _, m := range models {
@@ -72,6 +278,8 @@ func TestToolman(t *testing.T) {
 			}
 			// pretty print
 			prettyPrint(res)
+			elapsed := time.Since(start)
+			fmt.Printf("Prompt took %s", elapsed)
 		}
 	}
 }
@@ -85,10 +293,10 @@ func TestVectorSearch(t *testing.T) {
 	bellmanUrl := os.Getenv("BELLMAN_URL")
 	bellmanToken := os.Getenv("BELLMAN_TOKEN")
 
-	allTools := ptc.GetMockBellmanTools(true)
+	allTools := GetMockBellmanTools(true)
 
 	// create Bellman client
-	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
+	client := bellman.New(bellmanUrl, bellman.Key{Name: "test", Token: bellmanToken})
 
 	// embed all tool descr and index
 	log.Printf("embedding tool descriptions")
@@ -160,7 +368,7 @@ func TestAutoPTC(t *testing.T) {
 	})
 
 	// define bellman tools
-	mockTools := ptc.GetMockBellmanTools(true)
+	mockTools := GetMockBellmanTools(true)
 	//regularTools, PTCTools := ptc.AdaptToolsToPTC(vm, mockTools, gen.JavaScript)
 	//allTools := append(regularTools, PTCTools...)
 
@@ -172,7 +380,7 @@ You are a Financial Assistant. Today is 2026-02-03.
 You solve complex logic by writing JavaScript code for the code_execution tool.`
 
 	// create Bellman llm and run agent
-	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
+	client := bellman.New(bellmanUrl, bellman.Key{Name: "test", Token: bellmanToken})
 	llm := client.Generator().Model(openai.GenModel_gpt4o_mini).
 		System(systemPrompt).
 		SetTools(mockTools...).Temperature(0)
@@ -216,7 +424,9 @@ func prettyPrint(res *agent.Result[Result]) {
 	fmt.Printf("==== Used %d tokens ====\n", res.Metadata.TotalTokens)
 	costLow := (float64(res.Metadata.InputTokens)*0.15 + float64(res.Metadata.OutputTokens)*0.60) / 1_000_000.0
 	costHigh := (float64(res.Metadata.InputTokens)*0.30 + float64(res.Metadata.OutputTokens)*2.50) / 1_000_000.0
+	fmt.Printf("Input/output tokens: %d / %d\n", res.Metadata.InputTokens, res.Metadata.OutputTokens)
 	fmt.Printf("approx. $%.4f - $%.4f\n", costLow, costHigh)
+	fmt.Printf("Thinking tokens: %d\n", res.Metadata.ThinkingTokens)
 	fmt.Printf("==== Conversation ====\n")
 
 	for _, p := range res.Prompts {
@@ -252,7 +462,7 @@ func TestMockPTC(t *testing.T) {
 
 	// define go func "tools" for JS use
 	askBellman := func(url, token, userMessage string) string {
-		client := New(url, Key{Name: "test", Token: token})
+		client := bellman.New(url, bellman.Key{Name: "test", Token: token})
 		llm := client.Generator()
 		res, _ := llm.Model(openai.GenModel_gpt4o_mini).Temperature(1).
 			Prompt(
@@ -300,7 +510,7 @@ func TestMockPTC(t *testing.T) {
 		return string(jsonBytes), nil
 	}
 
-	codeExecution := tools.NewTool("code_execution",
+	codeExecution := tools.NewTool(ptc.PTCToolName,
 		tools.WithDescription(
 			"MANDATORY: You must write executable JavaScript code. "+
 				"Executes JS code. Environment has: Sum(a,b), askBellman(url,token,prompt), and CONFIG object. "+
@@ -332,7 +542,7 @@ You solve complex logic by writing JavaScript code for the code_execution tool.
 })`
 
 	// create Bellman llm and run agent
-	client := New(bellmanUrl, Key{Name: "test", Token: bellmanToken})
+	client := bellman.New(bellmanUrl, bellman.Key{Name: "test", Token: bellmanToken})
 	llm := client.Generator().Model(openai.GenModel_gpt4o_mini).
 		System(systemPrompt).
 		SetTools(codeExecution).Temperature(0)
