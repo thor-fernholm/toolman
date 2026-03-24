@@ -3,24 +3,26 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/dop251/goja"
 	"github.com/modfin/bellman"
 	"github.com/modfin/bellman/models/gen"
 	"github.com/modfin/bellman/prompt"
 	"github.com/modfin/bellman/schema"
 	"github.com/modfin/bellman/tools"
+	"github.com/modfin/bellman/tools/ptc"
 )
 
 // LOCA-bench endpoint: POST /loca
@@ -66,6 +68,917 @@ type locaResponse struct {
 	ToolmanHistory []prompt.Prompt `json:"toolman_history,omitempty"`
 	InputTokens    int             `json:"input_tokens,omitempty"`
 	OutputTokens   int             `json:"output_tokens,omitempty"`
+}
+
+type locaTraceCollector struct {
+	mu    sync.Mutex
+	calls []locaTraceCall
+}
+
+func (c *locaTraceCollector) Add(name string, args map[string]any) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.calls = append(c.calls, locaTraceCall{Name: name, Arguments: args})
+	c.mu.Unlock()
+}
+
+func (c *locaTraceCollector) Snapshot() []locaTraceCall {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]locaTraceCall, len(c.calls))
+	copy(out, c.calls)
+	return out
+}
+
+type locaEvidencePolicy struct {
+	enabled bool
+
+	requireMemory           bool
+	requireAnnouncements    bool
+	requireSubmissionStatus bool
+	requireCourseList       bool
+	requireAssignments      bool
+	requireQuizzes          bool
+	requireAssignmentCSV    bool
+	requireQuizCSV          bool
+
+	readMemory                bool
+	readAnnouncements         bool
+	readSubmissionStatus      bool
+	attemptedSubmissionStatus bool
+	submissionSoftFailed      bool
+	listedCourses             bool
+	listedAssignments         bool
+	listedQuizzes             bool
+	readAssignmentCSV         bool
+	readQuizCSV               bool
+	wroteAssignmentCSV        bool
+	wroteQuizCSV              bool
+}
+
+type locaWorkspaceState struct {
+	mu        sync.RWMutex
+	root      string
+	serverURL string
+	mcp       *mcpClient
+}
+
+type locaCourseEvidence struct {
+	ID   string
+	Code string
+	Name string
+}
+
+type locaTaskEvidence struct {
+	Kind              string
+	CourseID          string
+	CourseCode        string
+	CourseName        string
+	Title             string
+	Description       string
+	Deadline          string
+	PointsPossible    string
+	Credits           string
+	NumberOfQuestions string
+	TimeLimit         string
+	AllowedAttempts   string
+	ScoringPolicy     string
+}
+
+type locaSemanticState struct {
+	mu          sync.RWMutex
+	coursesByID map[string]locaCourseEvidence
+	assignments []locaTaskEvidence
+	quizzes     []locaTaskEvidence
+}
+
+func newLOCASemanticState() *locaSemanticState {
+	return &locaSemanticState{
+		coursesByID: map[string]locaCourseEvidence{},
+	}
+}
+
+func newLOCAWorkspaceState(mcp *mcpClient, reg *toolRegistry, initialRoot string) *locaWorkspaceState {
+	state := &locaWorkspaceState{
+		root: normalizeAllowedRootLOCA(initialRoot),
+		mcp:  mcp,
+	}
+	if serverURL, ok := findMCPServerForOrigToolLOCA(reg, "list_allowed_directories"); ok {
+		state.serverURL = serverURL
+	}
+	return state
+}
+
+func (s *locaWorkspaceState) Root() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.root
+}
+
+func (s *locaWorkspaceState) Refresh(ctx context.Context) (string, error) {
+	if s == nil {
+		return "", fmt.Errorf("workspace state unavailable")
+	}
+	if s.mcp == nil || strings.TrimSpace(s.serverURL) == "" {
+		return s.Root(), fmt.Errorf("list_allowed_directories unavailable")
+	}
+	out, err := s.mcp.CallTool(ctx, s.serverURL, "list_allowed_directories", map[string]any{})
+	if err != nil {
+		return "", err
+	}
+	root := extractAllowedWorkspaceRootLOCA(out)
+	if root == "" {
+		return "", fmt.Errorf("no allowed directory returned")
+	}
+	s.mu.Lock()
+	s.root = root
+	s.mu.Unlock()
+	return root, nil
+}
+
+func (s *locaSemanticState) ObserveToolResult(name string, args map[string]any, out any) {
+	if s == nil {
+		return
+	}
+	toolName := strings.ToLower(strings.TrimSpace(name))
+	objects := locaCollectObjectsLOCA(out)
+	if len(objects) == 0 {
+		return
+	}
+	if strings.Contains(toolName, "course") {
+		for _, obj := range objects {
+			s.observeCourse(obj)
+		}
+	}
+	if strings.Contains(toolName, "assignment") {
+		for _, obj := range objects {
+			s.observeTask("assignment", obj, args)
+		}
+	}
+	if strings.Contains(toolName, "quiz") {
+		for _, obj := range objects {
+			s.observeTask("quiz", obj, args)
+		}
+	}
+}
+
+func (s *locaSemanticState) HasEvidenceForKind(kind string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	switch kind {
+	case "assignment":
+		return len(s.assignments) > 0
+	case "quiz":
+		return len(s.quizzes) > 0
+	default:
+		return false
+	}
+}
+
+func (s *locaSemanticState) observeCourse(obj map[string]any) {
+	norm := locaNormalizeObjectKeysLOCA(obj)
+	course := locaCourseEvidence{
+		ID:   locaFirstScalarLOCA(norm["id"], norm["course_id"]),
+		Code: locaFirstScalarLOCA(norm["course_code"], norm["code"], norm["course"]),
+		Name: locaFirstScalarLOCA(norm["name"], norm["course_name"], norm["display_name"]),
+	}
+	if course.ID == "" && course.Code == "" && course.Name == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if course.ID != "" {
+		prev := s.coursesByID[course.ID]
+		if course.Code == "" {
+			course.Code = prev.Code
+		}
+		if course.Name == "" {
+			course.Name = prev.Name
+		}
+		s.coursesByID[course.ID] = course
+	}
+}
+
+func (s *locaSemanticState) observeTask(kind string, obj map[string]any, args map[string]any) {
+	norm := locaNormalizeObjectKeysLOCA(obj)
+	rec := locaTaskEvidence{
+		Kind:              kind,
+		CourseID:          locaFirstScalarLOCA(norm["course_id"], args["course_id"]),
+		CourseCode:        locaFirstScalarLOCA(norm["course_code"], args["course_code"]),
+		CourseName:        locaFirstScalarLOCA(norm["course_name"]),
+		Title:             locaFirstScalarLOCA(norm["assignment_title"], norm["quiz_title"], norm["title"], norm["name"]),
+		Description:       locaFirstScalarLOCA(norm["description"], norm["details"], norm["body"], norm["instructions"]),
+		Deadline:          locaFirstScalarLOCA(norm["deadline"], norm["due_at"], norm["due_date"]),
+		PointsPossible:    locaFirstScalarLOCA(norm["points_possible"], norm["points"], norm["max_points"]),
+		Credits:           locaFirstScalarLOCA(norm["credits"], norm["credit"]),
+		NumberOfQuestions: locaFirstScalarLOCA(norm["number_of_questions"], norm["question_count"]),
+		TimeLimit:         locaFirstScalarLOCA(norm["time_limit"], norm["time_limit_minutes"], norm["duration"]),
+		AllowedAttempts:   locaFirstScalarLOCA(norm["allowed_attempts"], norm["attempts_allowed"]),
+		ScoringPolicy:     locaFirstScalarLOCA(norm["scoring_policy"], norm["score_policy"], norm["grading_type"]),
+	}
+	if rec.Title == "" && rec.Description == "" && rec.Deadline == "" {
+		return
+	}
+	if rec.CourseID != "" {
+		s.mu.RLock()
+		course := s.coursesByID[rec.CourseID]
+		s.mu.RUnlock()
+		if rec.CourseCode == "" {
+			rec.CourseCode = course.Code
+		}
+		if rec.CourseName == "" {
+			rec.CourseName = course.Name
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch kind {
+	case "assignment":
+		s.assignments = locaUpsertTaskEvidenceLOCA(s.assignments, rec)
+	case "quiz":
+		s.quizzes = locaUpsertTaskEvidenceLOCA(s.quizzes, rec)
+	}
+}
+
+func locaUpsertTaskEvidenceLOCA(list []locaTaskEvidence, rec locaTaskEvidence) []locaTaskEvidence {
+	key := locaTaskEvidenceKeyLOCA(rec)
+	for i := range list {
+		if locaTaskEvidenceKeyLOCA(list[i]) != key {
+			continue
+		}
+		list[i] = locaMergeTaskEvidenceLOCA(list[i], rec)
+		return list
+	}
+	return append(list, rec)
+}
+
+func locaTaskEvidenceKeyLOCA(rec locaTaskEvidence) string {
+	return strings.Join([]string{
+		rec.Kind,
+		strings.ToLower(strings.TrimSpace(rec.CourseID)),
+		strings.ToLower(strings.TrimSpace(rec.CourseCode)),
+		strings.ToLower(strings.TrimSpace(rec.Title)),
+		strings.ToLower(strings.TrimSpace(rec.Deadline)),
+	}, "|")
+}
+
+func locaMergeTaskEvidenceLOCA(prev, next locaTaskEvidence) locaTaskEvidence {
+	if next.CourseID != "" {
+		prev.CourseID = next.CourseID
+	}
+	if next.CourseCode != "" {
+		prev.CourseCode = next.CourseCode
+	}
+	if next.CourseName != "" {
+		prev.CourseName = next.CourseName
+	}
+	if next.Title != "" {
+		prev.Title = next.Title
+	}
+	if next.Description != "" {
+		prev.Description = next.Description
+	}
+	if next.Deadline != "" {
+		prev.Deadline = next.Deadline
+	}
+	if next.PointsPossible != "" {
+		prev.PointsPossible = next.PointsPossible
+	}
+	if next.Credits != "" {
+		prev.Credits = next.Credits
+	}
+	if next.NumberOfQuestions != "" {
+		prev.NumberOfQuestions = next.NumberOfQuestions
+	}
+	if next.TimeLimit != "" {
+		prev.TimeLimit = next.TimeLimit
+	}
+	if next.AllowedAttempts != "" {
+		prev.AllowedAttempts = next.AllowedAttempts
+	}
+	if next.ScoringPolicy != "" {
+		prev.ScoringPolicy = next.ScoringPolicy
+	}
+	return prev
+}
+
+func newLOCAEvidencePolicy(query string, reg *toolRegistry) *locaEvidencePolicy {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return &locaEvidencePolicy{}
+	}
+
+	enabled := strings.Contains(q, "assignment") ||
+		strings.Contains(q, "quiz") ||
+		strings.Contains(q, "canvas") ||
+		strings.Contains(q, ".csv") ||
+		strings.Contains(q, "csv file")
+	if !enabled {
+		return &locaEvidencePolicy{}
+	}
+
+	hasMemoryTool := locaRegistryHasToolLike(reg, "memory")
+	hasAnnouncementTool := locaRegistryHasToolLike(reg, "announcement")
+	hasSubmissionTool := locaRegistryHasToolLike(reg, "submission") || locaRegistryHasToolLike(reg, "submitted") || locaRegistryHasToolLike(reg, "status")
+	hasCourseTool := locaRegistryHasToolLike(reg, "canvas_list_courses")
+	hasAssignmentTool := locaRegistryHasToolLike(reg, "canvas_list_assignments")
+	hasQuizTool := locaRegistryHasToolLike(reg, "canvas_list_quizzes")
+
+	return &locaEvidencePolicy{
+		enabled: enabled,
+
+		requireMemory:           strings.Contains(q, "memory") && hasMemoryTool,
+		requireAnnouncements:    strings.Contains(q, "announcement") && hasAnnouncementTool,
+		requireSubmissionStatus: locaNeedsSubmissionStatusLOCA(q) && hasSubmissionTool,
+		requireCourseList:       hasCourseTool && (hasAssignmentTool || hasQuizTool || hasAnnouncementTool),
+		requireAssignments:      strings.Contains(q, "assignment") && hasAssignmentTool,
+		requireQuizzes:          strings.Contains(q, "quiz") && hasQuizTool,
+		requireAssignmentCSV:    strings.Contains(q, "assignment_info.csv") || strings.Contains(q, "assignment"),
+		requireQuizCSV:          strings.Contains(q, "quiz_info.csv") || strings.Contains(q, "quiz"),
+	}
+}
+
+func locaNeedsSubmissionStatusLOCA(q string) bool {
+	return strings.Contains(q, "unfinished") ||
+		strings.Contains(q, "submission status") ||
+		strings.Contains(q, "submitted") ||
+		strings.Contains(q, "must submit") ||
+		strings.Contains(q, "have to be completed") ||
+		strings.Contains(q, "to be completed") ||
+		strings.Contains(q, "status")
+}
+
+func locaRegistryHasToolLike(reg *toolRegistry, needle string) bool {
+	if reg == nil {
+		return false
+	}
+	n := strings.ToLower(strings.TrimSpace(needle))
+	if n == "" {
+		return false
+	}
+	for _, orig := range reg.ToolNameToOrig {
+		if strings.Contains(strings.ToLower(orig), n) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *locaEvidencePolicy) ObserveTool(name string, args map[string]any) {
+	if p == nil || !p.enabled {
+		return
+	}
+	n := strings.ToLower(strings.TrimSpace(name))
+	target := locaTargetCSVFromArgs(args)
+
+	if strings.Contains(n, "memory") {
+		p.readMemory = true
+	}
+	if strings.Contains(n, "announcement") {
+		p.readAnnouncements = true
+	}
+	if strings.Contains(n, "submission") || strings.Contains(n, "submitted") || strings.Contains(n, "status") {
+		p.readSubmissionStatus = true
+	}
+	if strings.Contains(n, "canvas_list_courses") {
+		p.listedCourses = true
+	}
+	if strings.Contains(n, "canvas_list_assignments") {
+		p.listedAssignments = true
+	}
+	if strings.Contains(n, "canvas_list_quizzes") {
+		p.listedQuizzes = true
+	}
+	if locaLooksLikeReadToolLOCA(n) {
+		switch target {
+		case "assignment_info.csv":
+			p.readAssignmentCSV = true
+		case "quiz_info.csv":
+			p.readQuizCSV = true
+		}
+	}
+	if locaLooksLikeWriteToolLOCA(n) {
+		switch target {
+		case "assignment_info.csv":
+			p.wroteAssignmentCSV = true
+		case "quiz_info.csv":
+			p.wroteQuizCSV = true
+		}
+	}
+}
+
+func (p *locaEvidencePolicy) ObserveToolAttempt(name string) {
+	if p == nil || !p.enabled {
+		return
+	}
+	n := strings.ToLower(strings.TrimSpace(name))
+	if strings.Contains(n, "submission") || strings.Contains(n, "submitted") || strings.Contains(n, "status") {
+		p.attemptedSubmissionStatus = true
+	}
+}
+
+func (p *locaEvidencePolicy) ObserveToolResult(name string, out any, callErr error) {
+	if p == nil || !p.enabled {
+		return
+	}
+	n := strings.ToLower(strings.TrimSpace(name))
+	if !(strings.Contains(n, "submission") || strings.Contains(n, "submitted") || strings.Contains(n, "status")) {
+		return
+	}
+	if callErr != nil {
+		p.submissionSoftFailed = true
+		return
+	}
+	if locaToolOutputLooksMissingLOCA(out) || locaToolOutputLooksValidationErrorLOCA(out) {
+		p.submissionSoftFailed = true
+	}
+}
+
+func locaLooksLikeReadToolLOCA(name string) bool {
+	return strings.Contains(name, "read") || strings.Contains(name, "get") || strings.Contains(name, "list")
+}
+
+func locaLooksLikeWriteToolLOCA(name string) bool {
+	return strings.Contains(name, "write") ||
+		strings.Contains(name, "edit") ||
+		strings.Contains(name, "update") ||
+		strings.Contains(name, "replace") ||
+		strings.Contains(name, "append")
+}
+
+func locaTargetCSVFromArgs(args map[string]any) string {
+	if len(args) == 0 {
+		return ""
+	}
+	for _, key := range []string{"path", "file_path", "filepath", "filePath", "filename", "file"} {
+		if raw, ok := args[key].(string); ok {
+			base := strings.ToLower(strings.TrimSpace(raw))
+			if i := strings.LastIndexAny(base, "\\/"); i >= 0 {
+				base = base[i+1:]
+			}
+			if base == "assignment_info.csv" || base == "quiz_info.csv" {
+				return base
+			}
+		}
+	}
+	return ""
+}
+
+func (p *locaEvidencePolicy) CheckBeforeTool(name string, args map[string]any) error {
+	if p == nil || !p.enabled {
+		return nil
+	}
+	if !locaLooksLikeWriteToolLOCA(strings.ToLower(strings.TrimSpace(name))) {
+		return nil
+	}
+	target := locaTargetCSVFromArgs(args)
+	if target == "" {
+		return nil
+	}
+	if missing := p.missingEvidence(); len(missing) > 0 {
+		return fmt.Errorf("blocked premature write to %s: gather required evidence first (%s)", target, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func (p *locaEvidencePolicy) CheckBeforeFinal() error {
+	if p == nil || !p.enabled {
+		return nil
+	}
+	if missing := p.missingEvidence(); len(missing) > 0 {
+		return fmt.Errorf("cannot finish yet: required evidence is still missing (%s)", strings.Join(missing, ", "))
+	}
+	if p.requireAssignmentCSV && !p.wroteAssignmentCSV {
+		return fmt.Errorf("cannot finish yet: assignment_info.csv has not been written")
+	}
+	if p.requireQuizCSV && !p.wroteQuizCSV {
+		return fmt.Errorf("cannot finish yet: quiz_info.csv has not been written")
+	}
+	return nil
+}
+
+func (p *locaEvidencePolicy) missingEvidence() []string {
+	if p == nil || !p.enabled {
+		return nil
+	}
+	missing := make([]string, 0, 8)
+	if p.requireMemory && !p.readMemory {
+		missing = append(missing, "memory")
+	}
+	if p.requireAnnouncements && !p.readAnnouncements {
+		missing = append(missing, "announcements")
+	}
+	if p.requireSubmissionStatus && !p.readSubmissionStatus && !p.attemptedSubmissionStatus {
+		missing = append(missing, "submission_status")
+	}
+	if p.requireCourseList && !p.listedCourses {
+		missing = append(missing, "canvas_list_courses")
+	}
+	if p.requireAssignments && !p.listedAssignments {
+		missing = append(missing, "canvas_list_assignments")
+	}
+	if p.requireQuizzes && !p.listedQuizzes {
+		missing = append(missing, "canvas_list_quizzes")
+	}
+	if p.requireAssignmentCSV && !p.readAssignmentCSV {
+		missing = append(missing, "read_assignment_info.csv")
+	}
+	if p.requireQuizCSV && !p.readQuizCSV {
+		missing = append(missing, "read_quiz_info.csv")
+	}
+	return missing
+}
+
+func locaToolOutputLooksValidationErrorLOCA(out any) bool {
+	s := strings.ToLower(strings.TrimSpace(locaStringifyToolOutputLOCA(out)))
+	if s == "" {
+		return false
+	}
+	return strings.Contains(s, "input validation error") ||
+		strings.Contains(s, "not of type") ||
+		strings.Contains(s, "validation error") ||
+		strings.Contains(s, "\"error\"")
+}
+
+func locaToolOutputLooksMissingLOCA(out any) bool {
+	s := strings.ToLower(strings.TrimSpace(locaStringifyToolOutputLOCA(out)))
+	if s == "" {
+		return false
+	}
+	return strings.Contains(s, "no submission found") ||
+		strings.Contains(s, "not found")
+}
+
+func locaStringifyToolOutputLOCA(out any) string {
+	if out == nil {
+		return ""
+	}
+	switch v := out.(type) {
+	case string:
+		return v
+	default:
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
+}
+
+func locaEvidenceReminderLOCA(err error) string {
+	if err == nil {
+		return ""
+	}
+	return "Continue working. " + err.Error() + ". Read the missing sources, then overwrite both CSV files in sorted deadline order, and only then provide the final answer."
+}
+
+func locaCollectObjectsLOCA(v any) []map[string]any {
+	out := []map[string]any{}
+	seen := map[string]struct{}{}
+	var walk func(any)
+	walk = func(cur any) {
+		switch vv := cur.(type) {
+		case map[string]any:
+			b, _ := json.Marshal(vv)
+			key := string(b)
+			if _, ok := seen[key]; !ok {
+				seen[key] = struct{}{}
+				out = append(out, vv)
+			}
+			for _, val := range vv {
+				walk(val)
+			}
+		case []any:
+			for _, val := range vv {
+				walk(val)
+			}
+		}
+	}
+	walk(v)
+	return out
+}
+
+func locaNormalizeObjectKeysLOCA(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[locaNormalizeKeyLOCA(k)] = v
+	}
+	return out
+}
+
+func locaNormalizeKeyLOCA(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, " ", "_")
+	s = strings.ReplaceAll(s, "-", "_")
+	return s
+}
+
+func locaFirstScalarLOCA(vals ...any) string {
+	for _, val := range vals {
+		if s := locaScalarStringLOCA(val); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func locaScalarStringLOCA(v any) string {
+	switch vv := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(vv)
+	case json.Number:
+		return vv.String()
+	case float64:
+		return strconv.FormatFloat(vv, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(vv), 'f', -1, 32)
+	case int:
+		return strconv.Itoa(vv)
+	case int64:
+		return strconv.FormatInt(vv, 10)
+	case int32:
+		return strconv.FormatInt(int64(vv), 10)
+	case uint64:
+		return strconv.FormatUint(vv, 10)
+	case uint32:
+		return strconv.FormatUint(uint64(vv), 10)
+	case bool:
+		if vv {
+			return "true"
+		}
+		return "false"
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+}
+
+func locaExtractCSVContentLOCA(args map[string]any) string {
+	if len(args) == 0 {
+		return ""
+	}
+	for _, key := range []string{"content", "contents", "text", "new_text", "replacement", "data"} {
+		if s := locaFirstScalarLOCA(args[key]); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func locaValidateCSVWriteLOCA(args map[string]any, semantic *locaSemanticState) error {
+	if semantic == nil {
+		return nil
+	}
+	target := locaTargetCSVFromArgs(args)
+	if target == "" {
+		return nil
+	}
+	content := locaExtractCSVContentLOCA(args)
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	reader := csv.NewReader(strings.NewReader(content))
+	reader.FieldsPerRecord = -1
+	rows, err := reader.ReadAll()
+	if err != nil || len(rows) == 0 {
+		return nil
+	}
+	headers := rows[0]
+	if len(headers) == 0 {
+		return nil
+	}
+	kind := locaInferCSVKindLOCA(target, headers)
+	if kind == "" {
+		return nil
+	}
+	if !locaCSVHasMeaningfulDataRowsLOCA(rows[1:]) {
+		if semantic.HasEvidenceForKind(kind) {
+			return fmt.Errorf("csv write blocked: %s.csv cannot be header-only or empty after evidence for %s rows has been fetched", strings.TrimSuffix(target, ".csv"), kind)
+		}
+		return nil
+	}
+	findings := semantic.ValidateRows(kind, headers, rows[1:])
+	if len(findings) == 0 {
+		return nil
+	}
+	return fmt.Errorf("csv write blocked: %s", strings.Join(findings, "; "))
+}
+
+func locaCSVHasMeaningfulDataRowsLOCA(rows [][]string) bool {
+	for _, row := range rows {
+		for _, cell := range row {
+			if strings.TrimSpace(cell) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func locaInferCSVKindLOCA(target string, headers []string) string {
+	normHeaders := make([]string, 0, len(headers))
+	for _, h := range headers {
+		normHeaders = append(normHeaders, locaNormalizeKeyLOCA(h))
+	}
+	joined := strings.Join(normHeaders, ",")
+	switch {
+	case strings.Contains(strings.ToLower(target), "assignment") || strings.Contains(joined, "assignment_title") || strings.Contains(joined, "assignment_name"):
+		return "assignment"
+	case strings.Contains(strings.ToLower(target), "quiz") || strings.Contains(joined, "quiz_title") || strings.Contains(joined, "quiz_name") || strings.Contains(joined, "number_of_questions") || strings.Contains(joined, "time_limit"):
+		return "quiz"
+	default:
+		return ""
+	}
+}
+
+func (s *locaSemanticState) ValidateRows(kind string, headers []string, rows [][]string) []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	var records []locaTaskEvidence
+	switch kind {
+	case "assignment":
+		records = append(records, s.assignments...)
+	case "quiz":
+		records = append(records, s.quizzes...)
+	}
+	s.mu.RUnlock()
+	if len(records) == 0 {
+		return nil
+	}
+	idx := make(map[string]int, len(headers))
+	for i, h := range headers {
+		idx[locaNormalizeKeyLOCA(h)] = i
+	}
+	findings := []string{}
+	for rowNo, row := range rows {
+		rowMap := locaRowMapLOCA(headers, row)
+		match, ok := locaMatchEvidenceForRowLOCA(kind, rowMap, records)
+		if !ok {
+			findings = append(findings, locaGenericRowFindingLOCA(kind, rowMap, rowNo+2)...)
+			continue
+		}
+		findings = append(findings, locaSemanticFindingsForRowLOCA(match, rowMap, rowNo+2)...)
+		if len(findings) >= 4 {
+			break
+		}
+		_ = idx
+	}
+	return findings
+}
+
+func locaRowMapLOCA(headers, row []string) map[string]string {
+	out := map[string]string{}
+	for i, h := range headers {
+		if i >= len(row) {
+			out[locaNormalizeKeyLOCA(h)] = ""
+			continue
+		}
+		out[locaNormalizeKeyLOCA(h)] = strings.TrimSpace(row[i])
+	}
+	return out
+}
+
+func locaMatchEvidenceForRowLOCA(kind string, row map[string]string, records []locaTaskEvidence) (locaTaskEvidence, bool) {
+	title := locaFirstNonEmptyStringLOCA(row["assignment_title"], row["assignment_name"], row["quiz_title"], row["quiz_name"], row["title"], row["name"])
+	courseCode := row["course_code"]
+	deadline := row["deadline"]
+	bestIdx := -1
+	bestScore := -1
+	for i, rec := range records {
+		if rec.Kind != kind {
+			continue
+		}
+		score := 0
+		if title != "" && locaLooseEqualLOCA(title, rec.Title) {
+			score += 4
+		}
+		if courseCode != "" && locaLooseEqualLOCA(courseCode, rec.CourseCode) {
+			score += 2
+		}
+		if deadline != "" && rec.Deadline != "" && locaLooseEqualLOCA(deadline, rec.Deadline) {
+			score++
+		}
+		if score > bestScore {
+			bestScore = score
+			bestIdx = i
+		}
+	}
+	if bestIdx >= 0 && bestScore > 0 {
+		return records[bestIdx], true
+	}
+	return locaTaskEvidence{}, false
+}
+
+func locaSemanticFindingsForRowLOCA(rec locaTaskEvidence, row map[string]string, rowNo int) []string {
+	findings := []string{}
+	checkExact := func(header string, expected string, label string) {
+		actual, ok := row[header]
+		if !ok {
+			return
+		}
+		if expected == "" {
+			return
+		}
+		if strings.TrimSpace(actual) == "" {
+			findings = append(findings, fmt.Sprintf("row %d leaves %s empty even though evidence contains %q", rowNo, header, expected))
+			return
+		}
+		if !locaLooseEqualLOCA(actual, expected) {
+			findings = append(findings, fmt.Sprintf("row %d maps %s to %q but evidence indicates %s should be %q", rowNo, header, actual, label, expected))
+		}
+	}
+	checkPresent := func(header string, expected string) {
+		actual, ok := row[header]
+		if !ok || expected == "" {
+			return
+		}
+		if strings.TrimSpace(actual) == "" {
+			findings = append(findings, fmt.Sprintf("row %d leaves %s empty even though evidence contains %q", rowNo, header, expected))
+		}
+	}
+	checkExact("course_code", rec.CourseCode, "course code")
+	checkExact("course_name", rec.CourseName, "course name")
+	if rec.Kind == "assignment" {
+		checkExact("assignment_title", rec.Title, "assignment title")
+		checkExact("assignment_name", rec.Title, "assignment title")
+	} else if rec.Kind == "quiz" {
+		checkExact("quiz_title", rec.Title, "quiz title")
+		checkExact("quiz_name", rec.Title, "quiz title")
+	}
+	checkPresent("description", rec.Description)
+	checkPresent("deadline", rec.Deadline)
+	checkPresent("points_possible", rec.PointsPossible)
+	checkPresent("credits", rec.Credits)
+	checkPresent("number_of_questions", rec.NumberOfQuestions)
+	checkPresent("time_limit", rec.TimeLimit)
+	checkPresent("allowed_attempts", rec.AllowedAttempts)
+	checkPresent("scoring_policy", rec.ScoringPolicy)
+	return findings
+}
+
+func locaGenericRowFindingLOCA(kind string, row map[string]string, rowNo int) []string {
+	findings := []string{}
+	title := row["assignment_title"]
+	if kind == "quiz" {
+		title = locaFirstNonEmptyStringLOCA(row["quiz_title"], row["quiz_name"], row["title"])
+	} else {
+		title = locaFirstNonEmptyStringLOCA(row["assignment_title"], row["assignment_name"], row["title"])
+	}
+	if courseName := row["course_name"]; courseName != "" && title != "" && locaLooseEqualLOCA(courseName, title) {
+		findings = append(findings, fmt.Sprintf("row %d appears to use the item title as course_name", rowNo))
+	}
+	return findings
+}
+
+func locaFirstNonEmptyStringLOCA(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func locaLooseEqualLOCA(a, b string) bool {
+	an := locaNormalizeValueLOCA(a)
+	bn := locaNormalizeValueLOCA(b)
+	if an == "" || bn == "" {
+		return false
+	}
+	return an == bn
+}
+
+func locaNormalizeValueLOCA(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, " ", "")
+	s = strings.ReplaceAll(s, "_", "")
+	s = strings.ReplaceAll(s, "-", "")
+	s = strings.ReplaceAll(s, ":", "")
+	return s
+}
+
+func normalizePTCNullToolResponseLOCA(toolName string, out string, enabled bool) string {
+	if !enabled || toolName != ptc.PTCToolName {
+		return out
+	}
+	if strings.TrimSpace(out) != "null" {
+		return out
+	}
+	b, _ := json.Marshal(map[string]any{
+		"error": "code_execution returned null. Your JavaScript must return the final result at top level. Do not wrap the whole script in an extra IIFE like (function(){ ... })(); write top-level statements and end with return {...}.",
+	})
+	return string(b)
 }
 
 // --- Minimal MCP client (JSON-RPC 2.0 over HTTP) ---
@@ -706,18 +1619,18 @@ func injectAllowedWorkspaceRootLOCA(ctx context.Context, mcp *mcpClient, reg *to
 	serverURL, ok := findMCPServerForOrigToolLOCA(reg, "list_allowed_directories")
 	if !ok {
 		// Fall back to instruction-only.
-		appendWorkspacePathInstructionLOCA(req, "")
+		appendWorkspacePathInstructionLOCA(req, "", reg)
 		return ""
 	}
 
 	out, err := mcp.CallTool(ctx, serverURL, "list_allowed_directories", map[string]any{})
 	if err != nil {
-		appendWorkspacePathInstructionLOCA(req, "")
+		appendWorkspacePathInstructionLOCA(req, "", reg)
 		return ""
 	}
 
-	root := extractFirstWindowsPathLOCA(out)
-	appendWorkspacePathInstructionLOCA(req, root)
+	root := extractAllowedWorkspaceRootLOCA(out)
+	appendWorkspacePathInstructionLOCA(req, root, reg)
 	return root
 }
 
@@ -726,19 +1639,61 @@ func rewriteCSVPathArgsLOCA(args map[string]any, allowedRoot string) map[string]
 	if args == nil {
 		return args
 	}
-	out, ok := rewriteCSVPathsAnyLOCA(args, allowedRoot).(map[string]any)
+	sanitized, ok := sanitizeToolArgsAnyLOCA(args).(map[string]any)
 	if !ok {
-		return args
+		sanitized = args
+	}
+	out, ok := rewriteCSVPathsAnyLOCA(sanitized, allowedRoot).(map[string]any)
+	if !ok {
+		return sanitized
 	}
 	return out
 }
 
+func normalizeAllowedRootLOCA(root string) string {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return ""
+	}
+	root = strings.Trim(root, "\"")
+	root = filepath.Clean(root)
+	return strings.TrimRight(root, "\\/")
+}
+
+func sanitizeToolArgsAnyLOCA(v any) any {
+	switch vv := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(vv))
+		for k, val := range vv {
+			if val == nil {
+				continue
+			}
+			clean := sanitizeToolArgsAnyLOCA(val)
+			if clean == nil {
+				continue
+			}
+			out[k] = clean
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(vv))
+		for _, it := range vv {
+			clean := sanitizeToolArgsAnyLOCA(it)
+			if clean != nil {
+				out = append(out, clean)
+			}
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 func rewriteCSVPathsAnyLOCA(v any, allowedRoot string) any {
-	root := strings.TrimSpace(allowedRoot)
+	root := normalizeAllowedRootLOCA(allowedRoot)
 	if root == "" {
 		return v
 	}
-	root = strings.TrimRight(root, "\\/")
 
 	// Only rewrite values that are very likely to be file paths.
 	pathKeys := map[string]bool{
@@ -799,7 +1754,7 @@ func rewriteCSVPathStringLOCA(s string, root string) (string, bool) {
 	}
 	// If it is just a filename or a path, force it into the allowed root.
 	// Keep original base casing.
-	return root + "\\" + base, true
+	return filepath.Join(normalizeAllowedRootLOCA(root), base), true
 }
 
 func findMCPServerForOrigToolLOCA(reg *toolRegistry, origToolName string) (string, bool) {
@@ -825,21 +1780,36 @@ func findMCPServerForOrigToolLOCA(reg *toolRegistry, origToolName string) (strin
 	return "", false
 }
 
-func appendWorkspacePathInstructionLOCA(req *locaRequest, workspaceRoot string) {
+func appendWorkspacePathInstructionLOCA(req *locaRequest, workspaceRoot string, reg *toolRegistry) {
 	// Keep this short; it is purely to prevent path-related tool failures.
 	root := strings.TrimSpace(workspaceRoot)
-	instr := "IMPORTANT (workspace/files): You MUST edit the existing CSV files 'assignment_info.csv' and 'quiz_info.csv' in the allowed workspace. Do NOT create new CSV files. Use only absolute file paths inside the allowed workspace directory. Never use '/' or relative paths like 'assignment_info.csv'."
+	instr := "IMPORTANT (workspace/files): You MUST edit the existing CSV files 'assignment_info.csv' and 'quiz_info.csv' in the allowed workspace. Do NOT create new CSV files. Use only absolute file paths inside the allowed workspace directory. Never use '/workspace', 'C:\\workspace', '/', or relative paths like 'assignment_info.csv'."
 	if root != "" {
 		instr += fmt.Sprintf(" Allowed workspace root: %s. When accessing a file, set path to '%s\\\\<filename>'.", root, root)
 		instr += fmt.Sprintf(" The two files you must edit are: '%s\\\\assignment_info.csv' and '%s\\\\quiz_info.csv'.", root, root)
 	} else {
 		instr += " Call list_allowed_directories first, then prefix all file paths with the returned directory."
 	}
+	instr += " If a filesystem tool reports access denied, invalid path, path outside allowed directories, or no allowed directory returned, immediately call list_allowed_directories again, rebuild the absolute path from that returned directory, and retry once with the corrected path. Do not continue reasoning as if evidence is missing until the path issue is fixed."
 
 	// CSV correctness: prevent "prepend new rows" + leaving stale template/example lines behind.
 	instr += " CRITICAL (CSV): Before editing, you MUST read the current contents of BOTH CSV files. Use the EXACT existing header line (line 1) as the header, keep it as the FIRST line, and do NOT invent/rename/reorder columns. Remove any example/template rows that were already in the files (e.g. lines containing '(Example)'). When writing, OVERWRITE the entire file contents (replace the full old text with the full new text) so the final file contains ONLY: the header line + the required data rows. Do not prepend/append snippets. Perform one edit per file that replaces the entire content."
+	instr += " Build rows from a canonical intermediate object before serializing to CSV: first normalize each real-world item into semantic fields such as course_code, course_name, title, description, deadline, points_possible, credits, number_of_questions, time_limit, allowed_attempts, and scoring_policy; then map those semantic fields onto the EXACT target header names. Never map by column position or by vaguely similar nearby keys."
+	instr += " Header mapping rules: course_code must come from the course's code/identifier; course_name must come from the course's human-readable name; assignment_title or quiz_title must come from the assignment/quiz title or name; description must use the item's descriptive text when available; points_possible, credits, number_of_questions, time_limit, allowed_attempts, and scoring_policy must be filled whenever the fetched item data contains them."
+	instr += " Before writing each CSV, audit every column in the header against the source object you are serializing. If a value exists in the fetched evidence, do not leave that CSV field blank. If the source data does not contain a field, only then leave it empty."
 
 	instr += " IMPORTANT (Canvas IDs): Never call course-specific tools with course_id=0. Always call canvas_list_courses first, then iterate over the returned course IDs when calling canvas_list_assignments/canvas_list_quizzes/canvas_list_announcements."
+	instr += " IMPORTANT (evidence-first workflow): Do not write any CSV and do not give a final answer until you have completed the required evidence checklist for this task. First read BOTH CSV files to preserve the exact header. Then gather course IDs. Then gather assignments and quizzes for every course. If the task mentions announcements, unfinished work, submission status, or memory, you MUST explicitly fetch those sources before deciding what belongs in the CSVs."
+	if locaRegistryHasToolLike(reg, "memory") {
+		instr += " If the prompt says personal information is stored in memory, call the memory tool before deciding requirements."
+	}
+	if locaRegistryHasToolLike(reg, "announcement") {
+		instr += " If the prompt says some work may not need submission according to teacher announcements, announcements are mandatory evidence rather than optional context."
+	}
+	if locaRegistryHasToolLike(reg, "submission") || locaRegistryHasToolLike(reg, "submitted") || locaRegistryHasToolLike(reg, "status") {
+		instr += " If the prompt asks for unfinished or required submissions, you MUST check submission-status related tools before writing."
+	}
+	instr += " IMPORTANT (sorting): Before writing, ensure rows are sorted by deadline ascending; for identical deadlines, sort by class code in dictionary order."
 
 	s := strings.TrimSpace(req.SystemPrompt)
 	if s != "" {
@@ -848,65 +1818,160 @@ func appendWorkspacePathInstructionLOCA(req *locaRequest, workspaceRoot string) 
 	req.SystemPrompt = s + instr
 }
 
-func extractFirstWindowsPathLOCA(out any) string {
-	// Best-effort extraction from common MCP wrapper shapes.
-	var text string
-	switch v := out.(type) {
-	case string:
-		text = v
-	case map[string]any:
-		// Prefer data.content if present.
-		if d, ok := v["data"].(map[string]any); ok {
-			if c, ok := d["content"].(string); ok {
-				text = c
-			}
-		}
-		if text == "" {
-			if sc, ok := v["structured_content"].(map[string]any); ok {
-				if c, ok := sc["content"].(string); ok {
-					text = c
-				}
-			}
-		}
-		if text == "" {
-			if content, ok := v["content"].([]any); ok && len(content) > 0 {
-				if first, ok := content[0].(map[string]any); ok {
-					if t, ok := first["text"].(string); ok {
-						text = t
-					}
-				}
-			}
-		}
-	default:
-		// Last resort: JSON encode to string.
-		b, _ := json.Marshal(v)
-		text = string(b)
-	}
-
-	// Find the first occurrence of a Windows drive path (e.g. C:\...).
-	idx := strings.Index(text, ":\\")
-	if idx <= 0 {
+func extractAllowedWorkspaceRootLOCA(out any) string {
+	candidates := collectPathCandidatesLOCA(out)
+	if len(candidates) == 0 {
 		return ""
 	}
-	start := idx - 1
-	// Expand backwards to include drive letter.
-	for start > 0 {
-		ch := text[start-1]
-		if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') {
-			start--
-			break
+	sort.SliceStable(candidates, func(i, j int) bool {
+		left := strings.ToLower(candidates[i])
+		right := strings.ToLower(candidates[j])
+		leftScore := strings.Contains(left, "agent_workspace")
+		rightScore := strings.Contains(right, "agent_workspace")
+		if leftScore != rightScore {
+			return leftScore
 		}
-		break
-	}
-	end := idx + 3
-	for end < len(text) {
-		c := text[end]
-		if c == '\n' || c == '\r' || c == '"' {
-			break
+		return len(left) < len(right)
+	})
+	for _, candidate := range candidates {
+		if root := normalizeAllowedRootLOCA(candidate); root != "" {
+			return root
 		}
-		end++
 	}
-	return strings.TrimSpace(text[start:end])
+	return ""
+}
+
+func collectPathCandidatesLOCA(v any) []string {
+	out := []string{}
+	seen := map[string]struct{}{}
+	var walk func(any)
+	walk = func(cur any) {
+		switch vv := cur.(type) {
+		case string:
+			for _, candidate := range extractPathStringsLOCA(vv) {
+				if _, ok := seen[candidate]; ok {
+					continue
+				}
+				seen[candidate] = struct{}{}
+				out = append(out, candidate)
+			}
+		case map[string]any:
+			for _, val := range vv {
+				walk(val)
+			}
+		case []any:
+			for _, val := range vv {
+				walk(val)
+			}
+		default:
+			return
+		}
+	}
+	walk(v)
+	return out
+}
+
+func extractPathStringsLOCA(text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	fields := strings.FieldsFunc(text, func(r rune) bool {
+		switch r {
+		case '\r', '\n', '\t', ' ', '"', '\'', ',', ';', '[', ']', '{', '}', '(', ')':
+			return true
+		default:
+			return false
+		}
+	})
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		if looksLikeAbsolutePathLOCA(field) {
+			out = append(out, field)
+		}
+	}
+	return out
+}
+
+func looksLikeAbsolutePathLOCA(path string) bool {
+	if len(path) >= 3 && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':' && (path[2] == '\\' || path[2] == '/') {
+		return true
+	}
+	if strings.HasPrefix(path, `\\`) {
+		return true
+	}
+	if strings.HasPrefix(path, "/") && strings.Contains(strings.ToLower(path), "workspace") {
+		return true
+	}
+	return false
+}
+
+func locaToolTouchesFilesystemLOCA(toolName string, args map[string]any) bool {
+	if locaTargetCSVFromArgs(args) != "" {
+		return true
+	}
+	n := strings.ToLower(strings.TrimSpace(toolName))
+	if n == "" {
+		return false
+	}
+	return strings.Contains(n, "file") ||
+		strings.Contains(n, "directory") ||
+		strings.Contains(n, "read_text") ||
+		strings.Contains(n, "write_file") ||
+		strings.Contains(n, "list_allowed_directories")
+}
+
+func resolveToolArgsLOCA(ctx context.Context, state *locaWorkspaceState, toolName string, args map[string]any) (map[string]any, error) {
+	resolved := rewriteCSVPathArgsLOCA(args, "")
+	if !locaToolTouchesFilesystemLOCA(toolName, resolved) {
+		return resolved, nil
+	}
+	root := ""
+	if state != nil {
+		root = state.Root()
+	}
+	if root == "" {
+		if state == nil {
+			return resolved, fmt.Errorf("no allowed directory returned")
+		}
+		var err error
+		root, err = state.Refresh(ctx)
+		if err != nil {
+			return resolved, err
+		}
+	}
+	return rewriteCSVPathArgsLOCA(resolved, root), nil
+}
+
+func locaPathResolutionErrorLOCA(err error, out any) error {
+	if err != nil {
+		if perr := locaPathResolutionErrorFromStringLOCA(err.Error()); perr != nil {
+			return perr
+		}
+	}
+	if perr := locaPathResolutionErrorFromStringLOCA(locaStringifyToolOutputLOCA(out)); perr != nil {
+		return perr
+	}
+	return nil
+}
+
+func locaPathResolutionErrorFromStringLOCA(text string) error {
+	s := strings.ToLower(strings.TrimSpace(text))
+	if s == "" {
+		return nil
+	}
+	if strings.Contains(s, "path outside allowed directories") ||
+		strings.Contains(s, "access denied - path outside allowed directories") ||
+		strings.Contains(s, "access denied") ||
+		strings.Contains(s, "invalid path") ||
+		strings.Contains(s, "no allowed directory returned") {
+		return errors.New(strings.TrimSpace(text))
+	}
+	return nil
 }
 
 func writeLOCAResponse(w http.ResponseWriter, start time.Time, trace []locaTraceCall, hist []prompt.Prompt, ptcCode string, final any, inTok, outTok int, err error) {
@@ -953,19 +2018,33 @@ func toolChoiceToConfig(choice string, toolMap map[string]tools.Tool) (*tools.To
 	}
 }
 
-func runLOCANormal(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, reg *toolRegistry, req locaRequest, allowedRoot string) ([]locaTraceCall, any, []prompt.Prompt, int, int, error) {
-	model, err := gen.ToModel(req.BellmanModel)
-	if err != nil {
-		return nil, nil, nil, 0, 0, err
-	}
+type locaToolMode int
 
-	trace := make([]locaTraceCall, 0)
-	var traceMu sync.Mutex
+const (
+	locaToolModeNormal locaToolMode = iota
+	locaToolModePTC
+)
 
-	// Per-request tool result cache to avoid repeating identical, read-only calls.
-	// This is intentionally conservative: only cache tools that look non-mutating.
-	cache := map[string]string{}
+type locaPromptRunConfig struct {
+	maxSteps          int
+	singleToolPerTurn bool
+	policy            *locaEvidencePolicy
+	ptcNullGuard      bool
+}
+
+type locaPromptRunResult struct {
+	final   any
+	hist    []prompt.Prompt
+	inTok   int
+	outTok  int
+	ptcCode string
+}
+
+func buildLOCATools(ctx context.Context, mcp *mcpClient, reg *toolRegistry, allowedRoot string, mode locaToolMode, trace *locaTraceCollector, policy *locaEvidencePolicy) (map[string]tools.Tool, []tools.Tool) {
+	cache := map[string]any{}
 	var cacheMu sync.Mutex
+	workspace := newLOCAWorkspaceState(mcp, reg, allowedRoot)
+	semantic := newLOCASemanticState()
 
 	toolMap := map[string]tools.Tool{}
 	boot := make([]tools.Tool, 0, len(reg.Tools))
@@ -974,49 +2053,157 @@ func runLOCANormal(ctx context.Context, client *bellman.Bellman, mcp *mcpClient,
 		serverURL := reg.ToolNameToURL[name]
 		orig := reg.ToolNameToOrig[name]
 		localTool := t
-		localTool.UsePTC = false
+		localTool.UsePTC = mode == locaToolModePTC
 		localTool.Function = func(ctx context.Context, call tools.Call) (string, error) {
 			var args map[string]any
 			if err := json.Unmarshal(call.Argument, &args); err != nil {
 				args = map[string]any{}
 			}
-			args = rewriteCSVPathArgsLOCA(args, allowedRoot)
-			traceMu.Lock()
-			trace = append(trace, locaTraceCall{Name: orig, Arguments: args})
-			traceMu.Unlock()
+			args, err := resolveToolArgsLOCA(ctx, workspace, orig, args)
+			if err != nil {
+				return "", fmt.Errorf("filesystem path resolution failed before %s: %w", orig, err)
+			}
+			trace.Add(orig, args)
+			policy.ObserveToolAttempt(orig)
+			if err := policy.CheckBeforeTool(orig, args); err != nil {
+				b, _ := json.Marshal(map[string]any{"error": err.Error()})
+				return string(b), nil
+			}
+			if err := locaValidateCSVWriteLOCA(args, semantic); err != nil {
+				b, _ := json.Marshal(map[string]any{"error": err.Error()})
+				return string(b), nil
+			}
 
-			// Cache hit?
 			if isCacheableToolLOCA(orig) {
 				key := toolCacheKeyLOCA(serverURL, orig, args)
 				cacheMu.Lock()
 				cached, ok := cache[key]
 				cacheMu.Unlock()
 				if ok {
-					return cached, nil
+					policy.ObserveTool(orig, args)
+					policy.ObserveToolResult(orig, cached, nil)
+					semantic.ObserveToolResult(orig, args, cached)
+					b, err := json.Marshal(cached)
+					if err != nil {
+						return "", err
+					}
+					return string(b), nil
 				}
 			}
 
 			out, err := mcp.CallTool(ctx, serverURL, orig, args)
-			//fmt.Println("out", out)
+			if perr := locaPathResolutionErrorLOCA(err, out); perr != nil && locaToolTouchesFilesystemLOCA(orig, args) {
+				refreshedRoot, refreshErr := workspace.Refresh(ctx)
+				if refreshErr != nil {
+					return "", fmt.Errorf("filesystem path resolution failed for %s: %v (refresh failed: %w)", orig, perr, refreshErr)
+				}
+				retriedArgs := rewriteCSVPathArgsLOCA(args, refreshedRoot)
+				trace.Add(orig, retriedArgs)
+				out, err = mcp.CallTool(ctx, serverURL, orig, retriedArgs)
+				if retryPathErr := locaPathResolutionErrorLOCA(err, out); retryPathErr != nil {
+					return "", fmt.Errorf("filesystem path resolution failed for %s after refresh to %s: %w", orig, refreshedRoot, retryPathErr)
+				}
+				args = retriedArgs
+			}
 			if err != nil {
+				policy.ObserveToolResult(orig, nil, err)
 				return "", err
+			}
+			policy.ObserveTool(orig, args)
+			policy.ObserveToolResult(orig, out, nil)
+			semantic.ObserveToolResult(orig, args, out)
+			if isCacheableToolLOCA(orig) {
+				key := toolCacheKeyLOCA(serverURL, orig, args)
+				cacheMu.Lock()
+				cache[key] = out
+				cacheMu.Unlock()
 			}
 			b, err := json.Marshal(out)
 			if err != nil {
 				return "", err
 			}
-			resp := string(b)
-			if isCacheableToolLOCA(orig) {
-				key := toolCacheKeyLOCA(serverURL, orig, args)
-				cacheMu.Lock()
-				cache[key] = resp
-				cacheMu.Unlock()
-			}
-			return resp, nil
+			return string(b), nil
 		}
 		boot = append(boot, localTool)
 		toolMap[localTool.Name] = localTool
 	}
+
+	return toolMap, boot
+}
+
+func runLOCAPromptLoop(ctx context.Context, g *gen.Generator, hist []prompt.Prompt, cfg locaPromptRunConfig) (locaPromptRunResult, error) {
+	resOut := locaPromptRunResult{hist: hist}
+
+	for step := 0; step < cfg.maxSteps; step++ {
+		res, err := g.Prompt(resOut.hist...)
+		if err != nil {
+			return resOut, err
+		}
+		resOut.inTok += res.Metadata.InputTokens
+		resOut.outTok += res.Metadata.OutputTokens
+
+		if res.IsText() {
+			if err := cfg.policy.CheckBeforeFinal(); err != nil {
+				resOut.hist = append(resOut.hist, prompt.AsUser(locaEvidenceReminderLOCA(err)))
+				continue
+			}
+			text, _ := res.AsText()
+			resOut.hist = append(resOut.hist, prompt.AsAssistant(text))
+			resOut.final = text
+			return resOut, nil
+		}
+		if !res.IsTools() {
+			return resOut, nil
+		}
+		for i, c := range res.Tools {
+			resOut.hist = append(resOut.hist, prompt.AsToolCall(c.ID, c.Name, c.Argument))
+
+			if c.Name == ptc.PTCToolName {
+				var arg struct {
+					Code string `json:"code"`
+				}
+				if err := json.Unmarshal(c.Argument, &arg); err == nil {
+					resOut.ptcCode = arg.Code
+				}
+			}
+
+			if cfg.singleToolPerTurn && i > 0 {
+				b, _ := json.Marshal(map[string]any{"error": "only one code_execution call allowed per turn"})
+				resOut.hist = append(resOut.hist, prompt.AsToolResponse(c.ID, c.Name, string(b)))
+				continue
+			}
+
+			if c.Ref == nil || c.Ref.Function == nil {
+				return resOut, fmt.Errorf("tool %q not found", c.Name)
+			}
+
+			out, err := c.Ref.Function(ctx, c)
+			if err != nil {
+				if locaPathResolutionErrorLOCA(err, nil) != nil {
+					return resOut, err
+				}
+				resOut.hist = append(resOut.hist, prompt.AsToolResponse(c.ID, c.Name, err.Error()))
+				continue
+			}
+			if perr := locaPathResolutionErrorLOCA(nil, out); perr != nil {
+				return resOut, fmt.Errorf("filesystem path resolution failed in %s: %w", c.Name, perr)
+			}
+			out = normalizePTCNullToolResponseLOCA(c.Name, out, cfg.ptcNullGuard)
+			resOut.hist = append(resOut.hist, prompt.AsToolResponse(c.ID, c.Name, out))
+		}
+	}
+	return resOut, fmt.Errorf("max steps reached")
+}
+
+func runLOCANormal(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, reg *toolRegistry, req locaRequest, allowedRoot string) ([]locaTraceCall, any, []prompt.Prompt, int, int, error) {
+	model, err := gen.ToModel(req.BellmanModel)
+	if err != nil {
+		return nil, nil, nil, 0, 0, err
+	}
+
+	trace := &locaTraceCollector{}
+	policy := newLOCAEvidencePolicy(req.Query, reg)
+	toolMap, boot := buildLOCATools(ctx, mcp, reg, allowedRoot, locaToolModeNormal, trace, policy)
 
 	g := client.Generator().
 		Model(model).
@@ -1028,47 +2215,19 @@ func runLOCANormal(ctx context.Context, client *bellman.Bellman, mcp *mcpClient,
 		g = g.MaxTokens(req.MaxTokens)
 	}
 	if tc, err := toolChoiceToConfig(req.ToolChoice, toolMap); err != nil {
-		return trace, nil, nil, 0, 0, err
+		return trace.Snapshot(), nil, nil, 0, 0, err
 	} else if tc != nil {
 		g = g.SetToolConfig(*tc)
 	}
 
-	hist := []prompt.Prompt{prompt.AsUser(req.Query)}
-	inTok := 0
-	outTok := 0
-
-	for step := 0; step < 20; step++ {
-		res, err := g.Prompt(hist...)
-		if err != nil {
-			return trace, nil, hist, inTok, outTok, err
-		}
-		inTok += res.Metadata.InputTokens
-		outTok += res.Metadata.OutputTokens
-
-		if res.IsText() {
-			text, _ := res.AsText()
-			hist = append(hist, prompt.AsAssistant(text))
-			return trace, text, hist, inTok, outTok, nil
-		}
-		if !res.IsTools() {
-			return trace, nil, hist, inTok, outTok, nil
-		}
-		for _, c := range res.Tools {
-			hist = append(hist, prompt.AsToolCall(c.ID, c.Name, c.Argument))
-			tool, ok := toolMap[c.Name]
-			if !ok || tool.Function == nil {
-				return trace, nil, hist, inTok, outTok, fmt.Errorf("tool %q not found", c.Name)
-			}
-			out, err := tool.Function(ctx, c)
-			fmt.Println("executed tool output: ", out)
-			if err != nil {
-				return trace, nil, hist, inTok, outTok, fmt.Errorf("tool %q failed: %w", c.Name, err)
-			}
-			hist = append(hist, prompt.AsToolResponse(c.ID, c.Name, out))
-			fmt.Println("LLM info: ", hist)
-		}
+	run, err := runLOCAPromptLoop(ctx, g, []prompt.Prompt{prompt.AsUser(req.Query)}, locaPromptRunConfig{
+		maxSteps: 20,
+		policy:   policy,
+	})
+	if err != nil {
+		return trace.Snapshot(), nil, run.hist, run.inTok, run.outTok, err
 	}
-	return trace, nil, hist, inTok, outTok, fmt.Errorf("max steps reached")
+	return trace.Snapshot(), run.final, run.hist, run.inTok, run.outTok, nil
 }
 
 func isCacheableToolLOCA(origToolName string) bool {
@@ -1099,232 +2258,39 @@ func runLOCAPTC(ctx context.Context, client *bellman.Bellman, mcp *mcpClient, re
 		return nil, "", nil, nil, 0, 0, err
 	}
 
-	trace := make([]locaTraceCall, 0)
-	var traceMu sync.Mutex
-	ptcCode := ""
-
-	// Per-request cache for non-mutating tool calls executed via JS bindings.
-	ptcCache := map[string]any{}
-	var ptcCacheMu sync.Mutex
-
-	// Build a persistent JS runtime for this request so state can survive across turns.
-	vm := goja.New()
-	var vmMu sync.Mutex
-	jsToolNames := make([]string, 0, len(reg.Tools))
-
-	// Bind each MCP tool as a global JS function (once per request).
-	for _, t := range reg.Tools {
-		name := t.Name
-		serverURL := reg.ToolNameToURL[name]
-		orig := reg.ToolNameToOrig[name]
-		jsName := name
-		// Avoid accidental collisions with the meta-tool name.
-		if jsName == "code_execution" {
-			jsName = "mcp_" + jsName
-		}
-		jsToolNames = append(jsToolNames, jsName)
-		_ = vm.Set(jsName, func(fc goja.FunctionCall) goja.Value {
-			// Enforce a single object argument (common LLM mistake: multiple args).
-			if len(fc.Arguments) > 1 {
-				return vm.ToValue(map[string]any{
-					"ok":    false,
-					"error": fmt.Sprintf("%s expects exactly one object argument", jsName),
-				})
-			}
-
-			var args map[string]any
-			if len(fc.Arguments) == 1 {
-				exp := fc.Arguments[0].Export()
-				m, ok := exp.(map[string]any)
-				if ok {
-					args = m
-				} else {
-					args = map[string]any{}
-				}
-			} else {
-				args = map[string]any{}
-			}
-
-			// If the model tries common wrong roots for the two CSV files, rewrite to the
-			// allowed workspace root so we don't spam access-denied calls.
-			args = rewriteCSVPathArgsLOCA(args, allowedRoot)
-
-			traceMu.Lock()
-			trace = append(trace, locaTraceCall{Name: orig, Arguments: args})
-			traceMu.Unlock()
-
-			if isCacheableToolLOCA(orig) {
-				key := toolCacheKeyLOCA(serverURL, orig, args)
-				ptcCacheMu.Lock()
-				cached, ok := ptcCache[key]
-				ptcCacheMu.Unlock()
-				if ok {
-					return vm.ToValue(cached)
-				}
-			}
-
-			out, err := mcp.CallTool(ctx, serverURL, orig, args)
-			//fmt.Println("executed tool output: ", out)
-			if err != nil {
-				return vm.ToValue(map[string]any{"ok": false, "error": err.Error()})
-			}
-			if isCacheableToolLOCA(orig) {
-				key := toolCacheKeyLOCA(serverURL, orig, args)
-				ptcCacheMu.Lock()
-				ptcCache[key] = out
-				ptcCacheMu.Unlock()
-			}
-			return vm.ToValue(out)
-		})
-	}
-
-	// Build code_execution tool.
-	codeTool := tools.NewTool("code_execution",
-		tools.WithDescription("Execute top-level JavaScript in a persistent runtime and return the final value as JSON."),
-		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
-			var arg struct {
-				Code string `json:"code"`
-			}
-			if err := json.Unmarshal(call.Argument, &arg); err != nil {
-				return "", err
-			}
-			ptcCode = arg.Code
-
-			guarded, gerr := guardRailJSLOCA(arg.Code)
-			if gerr != nil {
-				// Return as a tool output payload (not an RPC error) so the model can fix its code.
-				b, _ := json.Marshal(map[string]any{"error": gerr.Error()})
-				return string(b), nil
-			}
-
-			timeout := time.Duration(req.TimeoutMS) * time.Millisecond
-			if timeout <= 0 {
-				timeout = 10 * time.Second
-			}
-
-			var timedOut int32
-			timer := time.AfterFunc(timeout, func() {
-				atomic.StoreInt32(&timedOut, 1)
-				vm.Interrupt("timeout")
-			})
-			defer timer.Stop()
-
-			// Execute JS in the persistent runtime.
-			vmMu.Lock()
-			v, err := vm.RunString(guarded)
-			vmMu.Unlock()
-			if err != nil {
-				if atomic.LoadInt32(&timedOut) == 1 {
-					b, _ := json.Marshal(map[string]any{"error": fmt.Sprintf("timeout after %s", timeout)})
-					return string(b), nil
-				}
-				b, _ := json.Marshal(map[string]any{"error": err.Error()})
-				return string(b), nil
-			}
-			b, err := json.Marshal(v.Export())
-			if err != nil {
-				return "", err
-			}
-			return string(b), nil
-		}),
-	)
-	codeTool.ArgumentSchema = &schema.JSON{
-		Type: schema.Object,
-		Properties: map[string]*schema.JSON{
-			"code": {Type: schema.String, Description: "JavaScript to execute"},
-		},
-		Required: []string{"code"},
-	}
-
-	system := strings.TrimSpace(req.SystemPrompt)
-	if system != "" {
-		system += "\n\n"
-	}
-	system += locaPTCSystemInstruction(jsToolNames)
+	trace := &locaTraceCollector{}
+	policy := newLOCAEvidencePolicy(req.Query, reg)
+	toolMap, boot := buildLOCATools(ctx, mcp, reg, allowedRoot, locaToolModePTC, trace, policy)
 
 	g := client.Generator().
 		Model(model).
-		System(system).
-		SetTools(codeTool).
-		SetToolConfig(tools.AutoTool).
+		System(req.SystemPrompt).
+		SetTools(boot...).
 		WithContext(ctx).
 		Temperature(req.Temperature)
 	if req.MaxTokens > 0 {
 		g = g.MaxTokens(req.MaxTokens)
 	}
+	g, err = g.ActivatePTC(ptc.JavaScript)
+	if err != nil {
+		return trace.Snapshot(), "", nil, nil, 0, 0, err
+	}
+	if tc, err := toolChoiceToConfig(req.ToolChoice, toolMap); err != nil {
+		return trace.Snapshot(), "", nil, nil, 0, 0, err
+	} else if tc != nil {
+		g = g.SetToolConfig(*tc)
+	} else {
+		g = g.SetToolConfig(tools.AutoTool)
+	}
 
-	hist := []prompt.Prompt{prompt.AsUser(req.Query)}
-	inTok := 0
-	outTok := 0
-
-	for step := 0; step < 6; step++ {
-		res, err := g.Prompt(hist...)
-		if err != nil {
-			return trace, ptcCode, nil, hist, inTok, outTok, err
-		}
-		inTok += res.Metadata.InputTokens
-		outTok += res.Metadata.OutputTokens
-		//fmt.Println("Input token: ", inTok)
-		if res.IsText() {
-			text, _ := res.AsText()
-			hist = append(hist, prompt.AsAssistant(text))
-			return trace, ptcCode, text, hist, inTok, outTok, nil
-		}
-		if !res.IsTools() {
-			return trace, ptcCode, nil, hist, inTok, outTok, nil
-		}
-		for i, c := range res.Tools {
-			hist = append(hist, prompt.AsToolCall(c.ID, c.Name, c.Argument))
-			if i > 0 {
-				// Enforce single tool call per turn: reply to extra calls with an error payload.
-				b, _ := json.Marshal(map[string]any{"error": "only one code_execution call allowed per turn"})
-				hist = append(hist, prompt.AsToolResponse(c.ID, c.Name, string(b)))
-				continue
-			}
-			out, err := codeTool.Function(ctx, c)
-			if err != nil {
-				// Treat as transport error (rare); still attach tool response for consistency.
-				hist = append(hist, prompt.AsToolResponse(c.ID, c.Name, err.Error()))
-				return trace, ptcCode, nil, hist, inTok, outTok, err
-			}
-			hist = append(hist, prompt.AsToolResponse(c.ID, c.Name, out))
-		}
+	run, err := runLOCAPromptLoop(ctx, g, []prompt.Prompt{prompt.AsUser(req.Query)}, locaPromptRunConfig{
+		maxSteps:          6,
+		singleToolPerTurn: true,
+		policy:            policy,
+		ptcNullGuard:      true,
+	})
+	if err != nil {
+		return trace.Snapshot(), run.ptcCode, nil, run.hist, run.inTok, run.outTok, err
 	}
-	return trace, ptcCode, nil, hist, inTok, outTok, fmt.Errorf("max steps reached")
-}
-
-func guardRailJSLOCA(code string) (string, error) {
-	// Keep this intentionally small but aligned with the bench instruction.
-	if strings.TrimSpace(code) == "" {
-		return code, fmt.Errorf("RuntimeError: No JavaScript code provided")
-	}
-	// Forbid logging: models sometimes attempt to debug via console.
-	if strings.Contains(code, "console.log(") || strings.Contains(code, "print(") || strings.Contains(code, "print( ") {
-		return code, fmt.Errorf("RuntimeError: Logging is forbidden (console.log/print)")
-	}
-	// Forbid async/await: this runtime is synchronous and tool calls are blocking.
-	if strings.Contains(code, "async ") || strings.Contains(code, "await") || strings.Contains(code, "async(") {
-		return code, fmt.Errorf("RuntimeError: Async/await is forbidden")
-	}
-	return code, nil
-}
-
-func locaPTCSystemInstruction(jsToolNames []string) string {
-	var b strings.Builder
-	b.WriteString("You are running a LOCA function-calling benchmark.\n")
-	b.WriteString("Use the tool 'code_execution' to run JavaScript that calls tools as functions.\n")
-	b.WriteString("If you call tools, you MUST call 'code_execution' exactly once per turn.\n")
-	b.WriteString("In code_execution, write top-level JavaScript. No async/await. No logging (console.log/print).\n")
-	b.WriteString("The tool returns the JSON value of the LAST evaluated expression; end your script with an object like: ({a, b}).\n")
-	b.WriteString("Do NOT use a top-level 'return'.\n")
-	b.WriteString("Call tools as global functions: tool_name({ ... }) with exactly one object argument.\n")
-	b.WriteString("Treat tool outputs as opaque JSON objects; only use fields you see returned.\n")
-	b.WriteString("\nAvailable tool names:\n")
-	sort.Strings(jsToolNames)
-	for _, n := range jsToolNames {
-		b.WriteString("- ")
-		b.WriteString(n)
-		b.WriteString("\n")
-	}
-	return b.String()
+	return trace.Snapshot(), run.ptcCode, run.final, run.hist, run.inTok, run.outTok, nil
 }
