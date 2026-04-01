@@ -25,6 +25,7 @@ type JavaScript struct {
 	toolName string
 	output   *resultOutput
 	Log      *slog.Logger `json:"-"`
+	fresh    bool
 }
 
 type TemplateData struct {
@@ -65,6 +66,7 @@ func NewRuntime(toolName string) (*JavaScript, error) {
 		runtime:  goja.New(),
 		mu:       sync.Mutex{},
 		toolName: toolName,
+		fresh:    true,
 	}
 	return javaScript.registerResult()
 }
@@ -86,6 +88,10 @@ func (j *JavaScript) log(msg string, args ...any) {
 		return
 	}
 	j.Log.Debug("[bellman/javascript] "+msg, args...)
+}
+
+func (j *JavaScript) IsFresh() bool {
+	return j.fresh
 }
 
 const nilValue string = "null" // nil in JS

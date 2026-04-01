@@ -14,6 +14,7 @@ type Runtime interface {
 	Lock()
 	Unlock()
 	Execute(code string) (string, error, error)
+	IsFresh() bool
 }
 
 type ProgramLanguage string

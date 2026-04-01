@@ -48,6 +48,23 @@ func (b *Generator) Prompt(prompts ...prompt.Prompt) (*Response, error) {
 	return prompter.Prompt(prompts...)
 }
 
+// ValidateStateConversation checks if the runtime state has been reset (fresh runtime and conversation contains PTC tool calls)
+func (b *Generator) ValidateStateConversation(prompts ...prompt.Prompt) []prompt.Prompt {
+	if b.Runtime.IsFresh() {
+		// if history contains PTC call
+		for _, p := range prompts {
+			if p.Role == prompt.ToolCallRole && p.ToolCall.Name == ptc.ToolName {
+				// prepend system alert reset to latest user promt text seems like Geminis best solution...
+				// maybe ask agaton?!
+				//prompts = append(prompts, prompt.AsAssistant(
+				//	"Note: the JavaScript runtime has been reset. All previously declared variables are gone.",
+				//))
+			}
+		}
+	}
+	return prompts
+}
+
 func (b *Generator) clone() *Generator {
 	var bb Generator
 	bb = *b
@@ -174,6 +191,15 @@ func (b *Generator) SetPTCSystemFragment(fragment string) *Generator {
 	bb.Request.PTCSystemFragment = &fragment
 
 	return bb
+}
+
+func (b *Generator) IsPTCEnabled() bool {
+	for _, t := range b.Tools() {
+		if t.Name == ptc.ToolName {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Generator) SetToolConfig(tool tools.Tool) *Generator {

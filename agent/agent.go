@@ -24,6 +24,9 @@ func Run[T any](maxDepth int, parallelism int, g *gen.Generator, prompts ...prom
 
 	promptMetadata := models.Metadata{Model: g.Request.Model.Name}
 	for i := 0; i < maxDepth; i++ {
+		//if g.IsPTCEnabled() {
+		//	prompts = g.ValidateStateConversation()
+		//}
 		resp, err := g.Prompt(prompts...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to prompt: %w, at depth %d", err, i)
