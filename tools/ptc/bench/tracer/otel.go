@@ -103,7 +103,7 @@ func (t *Tracer) Trace(p prompt.Prompt, messages []prompt.Prompt, metrics *Metri
 					attribute.Int("gen_ai.usage.input_tokens", metrics.InputTokens),
 					attribute.Int("gen_ai.usage.output_tokens", metrics.OutputTokens),
 					attribute.Int("gen_ai.usage.thinking_tokens", metrics.ThinkingTokens),
-					attribute.Int64("gen_ai.usage.llm_latency", metrics.LLMLatency.Milliseconds()),
+					attribute.Int64("usage.llm_latency", metrics.LLMLatency.Milliseconds()),
 				)
 			}
 		}
