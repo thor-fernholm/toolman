@@ -54,7 +54,6 @@ type Metrics struct {
 	InputTokens    int
 	OutputTokens   int
 	ThinkingTokens int
-	LLMLatency     time.Duration
 }
 
 // NewTracer creates a new cache
@@ -96,6 +95,9 @@ func (t *Tracer) Trace(p prompt.Prompt, messages []prompt.Prompt, metrics *Metri
 				attribute.String("gen_ai.response.model", t.Model.Name),
 				//attribute.String("gen_ai.output.messages", string(jsonResponse)),
 				attribute.String("gen_ai.prompt", fmt.Sprintf("Conversation history...")),
+			)
+		} else if chatSpan.Span != nil {
+			chatSpan.SetAttributes(
 				attribute.String("gen_ai.completion", p.Text),
 			)
 			if metrics != nil {
@@ -103,8 +105,9 @@ func (t *Tracer) Trace(p prompt.Prompt, messages []prompt.Prompt, metrics *Metri
 					attribute.Int("gen_ai.usage.input_tokens", metrics.InputTokens),
 					attribute.Int("gen_ai.usage.output_tokens", metrics.OutputTokens),
 					attribute.Int("gen_ai.usage.thinking_tokens", metrics.ThinkingTokens),
-					attribute.Int64("usage.llm_latency", metrics.LLMLatency.Milliseconds()),
 				)
+			} else {
+				log.Printf("no metrics available in llm trace!")
 			}
 		}
 		chatSpan.End()
@@ -117,6 +120,15 @@ func (t *Tracer) Trace(p prompt.Prompt, messages []prompt.Prompt, metrics *Metri
 				attribute.String("gen_ai.output.messages", string(jsonResponse)),
 				attribute.String("gen_ai.completion", "Tool Calls Requested"),
 			)
+			if metrics != nil {
+				chatSpan.SetAttributes(
+					attribute.Int("gen_ai.usage.input_tokens", metrics.InputTokens),
+					attribute.Int("gen_ai.usage.output_tokens", metrics.OutputTokens),
+					attribute.Int("gen_ai.usage.thinking_tokens", metrics.ThinkingTokens),
+				)
+			} else {
+				log.Printf("no metrics available in llm trace!")
+			}
 			chatSpan.End()
 			time.Sleep(1 * time.Millisecond) // sleep 1ms to enforce otel order
 		}

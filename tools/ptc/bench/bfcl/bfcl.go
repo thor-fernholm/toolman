@@ -99,7 +99,7 @@ func (c *Cache) HandleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 
 	defer func() {
 		i.mu.Lock()
-		i.timer.Reset(15 * time.Second)
+		i.timer.Reset(1 * time.Minute)
 		i.mu.Unlock()
 	}()
 
@@ -183,6 +183,7 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 	// prompt with retry (bfcl restarts on every test...)
 	maxRetries := 5
 	var res *gen.Response
+	var metrics *tracer.Metrics
 	for {
 		// trace llm call start (if not recording already)
 		if i.Tracer.ChatSpan.Span == nil || !i.Tracer.ChatSpan.IsRecording() {
@@ -194,7 +195,12 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 		duration := time.Since(start)
 		fmt.Printf("prompt duration: %v ms\n", duration.Milliseconds())
 
-		if err == nil {
+		if err == nil && res != nil {
+			metrics = &tracer.Metrics{
+				InputTokens:    res.Metadata.InputTokens,
+				OutputTokens:   res.Metadata.OutputTokens,
+				ThinkingTokens: res.Metadata.ThinkingTokens,
+			}
 			break
 		}
 
@@ -206,12 +212,7 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 		}
 
 		// trace error as assistant
-		i.Tracer.Trace(prompt.AsAssistant(err.Error()), toolmanConversation, &tracer.Metrics{
-			InputTokens:    0,
-			OutputTokens:   0,
-			ThinkingTokens: 0,
-			LLMLatency:     duration,
-		})
+		i.Tracer.Trace(prompt.AsAssistant(err.Error()), toolmanConversation, metrics)
 
 		// update retries counter
 		i.retries++
@@ -250,7 +251,7 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 
 	// trace tool calls
 	for _, call := range toolmanCalls {
-		i.Tracer.Trace(call, toolmanCalls, nil)
+		i.Tracer.Trace(call, toolmanCalls, metrics)
 	}
 
 	// If PTC enabled, and we get to this point:
@@ -295,7 +296,7 @@ func (i *Instance) getToolCalls(res *gen.Response) ([]prompt.Prompt, []Extracted
 	var toolmanCalls []prompt.Prompt
 	for _, tool := range res.Tools {
 		// PTC Tool Call
-		if tool.Name == ptc.PTCToolName {
+		if tool.Name == ptc.ToolName {
 			// Unmarshal the 'argument' string/bytes to get the JS code
 			var codeArgs struct {
 				Code string `json:"code"`
@@ -370,7 +371,7 @@ func (i *Instance) executionReplay(bellmanTools []tools.Tool, toolmanConversatio
 	}
 
 	// execution result --> toolman response
-	toolResponse := prompt.AsToolResponse(result.ToolID, ptc.PTCToolName, result.Output)
+	toolResponse := prompt.AsToolResponse(result.ToolID, ptc.ToolName, result.Output)
 	return nil, &toolResponse
 }
 
@@ -399,18 +400,23 @@ func toolmanToBFCLCall(tool tools.Call) (ExtractedCall, error) {
 func (c *Cache) ensureCache(req BenchmarkRequest) *Instance {
 	c.mu.Lock()
 
+	ptcFlag := "regular-fc" // regular function calling
+	if req.EnablePTC {
+		ptcFlag = "ptc-fc"
+	}
+
 	i, ok := c.Instances[req.TestID]
 	if !ok {
 		i = &Instance{
 			Replay: replay.NewReplay(),
-			Tracer: tracer.NewTracer("BFCL"),
+			Tracer: tracer.NewTracer(fmt.Sprintf("%s-%s-%s", req.TestID, ptcFlag, req.Model)),
 		}
-		i.timer = time.AfterFunc(15*time.Second, func() {
+		i.timer = time.AfterFunc(1*time.Minute, func() {
 			c.finish(req.TestID)
 		})
 		c.Instances[req.TestID] = i
 	} else {
-		i.timer.Reset(15 * time.Second)
+		i.timer.Reset(1 * time.Minute)
 	}
 	c.mu.Unlock()
 
