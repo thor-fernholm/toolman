@@ -48,6 +48,7 @@ type TracerRequest struct {
 	Tools          []interface{}   `json:"tools"`
 	SystemPrompt   string          `json:"system_prompt"`
 	TestID         string          `json:"test_id"`
+	PTCEnabled     bool            `json:"ptc_enabled"`
 }
 
 type Metrics struct {
@@ -82,19 +83,22 @@ func (t *Tracer) Trace(p prompt.Prompt, messages []prompt.Prompt, metrics *Metri
 				attribute.String("gen_ai.input.messages", string(jsonConversation)),
 				attribute.String("gen_ai.prompt", p.Text),
 				attribute.String("gen_ai.tool.definitions", t.ToolString),
+				attribute.String("span_type", "turn"),
 			)
 		}
 	case prompt.AssistantRole:
 		if chatSpan.Span == nil || !chatSpan.IsRecording() {
 			chatSpan.Context, chatSpan.Span = t.Tracer.Start(t.TurnSpan.Context, fmt.Sprintf("chat %s", t.Model.Name))
 			// add input message conversation
-			//jsonResponse, _ := json.MarshalIndent(messages, "", "  ")
+			jsonConversation, _ := json.MarshalIndent(messages, "", "  ")
 			chatSpan.SetAttributes(
 				attribute.String("gen_ai.operation.name", "chat"),
 				attribute.String("gen_ai.provider.name", t.Model.Provider),
 				attribute.String("gen_ai.response.model", t.Model.Name),
-				//attribute.String("gen_ai.output.messages", string(jsonResponse)),
+				attribute.String("gen_ai.input.messages", string(jsonConversation)),
 				attribute.String("gen_ai.prompt", fmt.Sprintf("Conversation history...")),
+				attribute.String("gen_ai.tool.definitions", t.ToolString),
+				attribute.String("span_type", "step"),
 			)
 		} else if chatSpan.Span != nil {
 			chatSpan.SetAttributes(
@@ -114,7 +118,7 @@ func (t *Tracer) Trace(p prompt.Prompt, messages []prompt.Prompt, metrics *Metri
 		time.Sleep(1 * time.Millisecond) // sleep 1ms to enforce otel order
 	case prompt.ToolCallRole:
 		if chatSpan.Span != nil {
-			// add input message conversation
+			// add llm output messages
 			jsonResponse, _ := json.MarshalIndent(messages, "", "  ")
 			chatSpan.SetAttributes(
 				attribute.String("gen_ai.output.messages", string(jsonResponse)),
@@ -140,6 +144,7 @@ func (t *Tracer) Trace(p prompt.Prompt, messages []prompt.Prompt, metrics *Metri
 			attribute.String("gen_ai.tool.name", p.ToolCall.Name),
 			attribute.String("gen_ai.tool.call.arguments", string(p.ToolCall.Arguments)),
 			attribute.String("gen_ai.tool.call.id", p.ToolCall.ToolCallID),
+			attribute.String("span_type", "tool"),
 		)
 		t.ToolSpans[p.ToolCall.ToolCallID] = toolSpan
 	case prompt.ToolResponseRole:
@@ -172,6 +177,7 @@ func (t *Tracer) TraceExec(p prompt.Prompt) {
 			attribute.String("gen_ai.tool.name", p.ToolCall.Name),
 			attribute.String("gen_ai.tool.call.arguments", string(p.ToolCall.Arguments)),
 			attribute.String("gen_ai.tool.call.id", p.ToolCall.ToolCallID),
+			attribute.String("span_type", "execution"),
 		)
 	case prompt.ToolResponseRole:
 		if execSpan.Span != nil {
@@ -226,8 +232,14 @@ func (t *Tracer) NewTrace(req TracerRequest) {
 	// By reassigning to 'ctx', all future spans will become children of this trace.
 	t.RootSpan.Context, t.RootSpan.Span = t.Tracer.Start(ctx, fmt.Sprintf("%s", req.TestID))
 
+	ptc_tag := "regular-fc"
+	if req.PTCEnabled {
+		ptc_tag = "ptc-fc"
+	}
+
 	t.RootSpan.SetAttributes(
 		attribute.String("gen_ai.system_instructions", req.SystemPrompt),
+		attribute.StringSlice("langfuse.trace.tags", []string{req.TestID, ptc_tag, req.Model}), // Important: tag for metric filtering "<test_id>-<ptc_enabled>-<model_name>"
 	)
 }
 

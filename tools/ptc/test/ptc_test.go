@@ -70,7 +70,7 @@ func TestStream(t *testing.T) {
 	}
 	fmt.Printf("----Prompt result: %v\n", res)
 
-	// add new tool calls!
+	// exec and add new tool calls!
 	newPrompts := getResponse(res)
 	prompts = append(prompts, newPrompts...)
 

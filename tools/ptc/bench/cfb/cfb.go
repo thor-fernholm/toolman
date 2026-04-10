@@ -208,7 +208,7 @@ func (i *Instance) replayGenerateCFB(w http.ResponseWriter, req BenchmarkRequest
 	for {
 		// trace llm call start (if not recording already)
 		if i.Tracer.ChatSpan.Span == nil || !i.Tracer.ChatSpan.IsRecording() {
-			i.Tracer.Trace(prompt.AsUser(""), toolmanConversation, nil)
+			i.Tracer.Trace(prompt.AsAssistant(""), toolmanConversation, nil)
 		}
 
 		start := time.Now()
@@ -555,6 +555,7 @@ func (c *Cache) ensureCache(req BenchmarkRequest) *Instance {
 			Tools:          req.Tools,
 			SystemPrompt:   req.SystemPrompt,
 			TestID:         req.TestID,
+			PTCEnabled:     req.EnablePTC,
 		})
 	}
 

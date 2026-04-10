@@ -43,11 +43,7 @@ Available '{{.PTCToolName}}' Functions:
  * {{.Description}}{{if .UnknownSchema}}
  * @returns { {{- .ReturnType -}} } (Warning: Unknown Schema){{end}}
  */
-declare function {{.Name}}(params: {
-{{- range .Args}}
-  {{.Name}}{{if not .Required}}?{{end}}: {{.Type}},{{if .Description}} // {{.Description}}{{end}}
-{{- end}}
-}): {{.ReturnType}};
+declare function {{.Name}}(params: {{.ArgumentType}}): {{.ReturnType}};
 {{end}}
 {{end}}
 

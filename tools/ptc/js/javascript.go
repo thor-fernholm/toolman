@@ -43,16 +43,9 @@ type TemplateData struct {
 type FunctionSignatureData struct {
 	Name          string
 	Description   string
-	Args          []ArgField
+	ArgumentType  string
 	ReturnType    string
 	UnknownSchema bool
-}
-
-type ArgField struct {
-	Name        string
-	Type        string
-	Required    bool
-	Description string
 }
 
 //go:embed prompts.tmpl
@@ -227,7 +220,7 @@ func (j *JavaScript) Execute(ctx context.Context, code string) (resString string
 	}()
 
 	// timeout and context interrupt
-	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Minute) // TODO too short?
 	defer cancel()
 	stop := context.AfterFunc(ctx, func() {
 		j.log("error: runtime interrupted", "error", ctx.Err())
@@ -341,15 +334,21 @@ func functionSignatures(tool ...tools.Tool) []FunctionSignatureData {
 
 		if t.ResponseSchema != nil && t.ResponseSchema.Type != "" {
 			if !(t.ResponseSchema.Type == "object" && len(t.ResponseSchema.Properties) == 0) {
-				returnType = SchemaToTS(t.ResponseSchema)
+				returnType = SchemaToTS(t.ResponseSchema, "")
 				unknownSchema = false
 			}
+		}
+
+		// Figure out argument type
+		argType := "Record<string, any>"
+		if t.ArgumentSchema != nil && t.ArgumentSchema.Type != "" {
+			argType = SchemaToTS(t.ArgumentSchema, "")
 		}
 
 		signatures = append(signatures, FunctionSignatureData{
 			Name:          escapeFunctionName(t.Name),
 			Description:   t.Description,
-			Args:          extractArgs(t.ArgumentSchema),
+			ArgumentType:  argType,
 			ReturnType:    returnType,
 			UnknownSchema: unknownSchema,
 		})
@@ -357,59 +356,9 @@ func functionSignatures(tool ...tools.Tool) []FunctionSignatureData {
 	return signatures
 }
 
-func extractArgs(s *schema.JSON) []ArgField {
-	if s == nil || len(s.Properties) == 0 {
-		return nil
-	}
-
-	required := map[string]bool{}
-	for _, r := range s.Required {
-		required[r] = true
-	}
-
-	var args []ArgField
-	for name, prop := range s.Properties {
-		cleanDesc := strings.ReplaceAll(prop.Description, "\n", " ")
-		cleanDesc = strings.TrimSpace(cleanDesc)
-
-		args = append(args, ArgField{
-			Name:        name,
-			Type:        mapJSONSchemaType(prop),
-			Required:    required[name],
-			Description: cleanDesc,
-		})
-	}
-
-	sort.Slice(args, func(i, j int) bool {
-		return args[i].Name < args[j].Name
-	})
-
-	return args
-}
-
-func mapJSONSchemaType(s *schema.JSON) string {
-	if s == nil {
-		return "unknown"
-	}
-
-	switch s.Type {
-	case "string":
-		return "string"
-	case "number", "integer":
-		return "number"
-	case "boolean":
-		return "boolean"
-	case "array":
-		return "any[]"
-	case "object":
-		return "object"
-	default:
-		return "unknown"
-	}
-}
-
-// SchemaToTS recursively converts a bellman schema.JSON into a TypeScript type string
-func SchemaToTS(s *schema.JSON) string {
+// SchemaToTS recursively converts a JSON schema into a formatted TypeScript type string.
+// 'indent' manages formatting for deeply nested objects.
+func SchemaToTS(s *schema.JSON, indent string) string {
 	if s == nil {
 		return "any"
 	}
@@ -422,23 +371,24 @@ func SchemaToTS(s *schema.JSON) string {
 	case "boolean":
 		return "boolean"
 	case "array":
-		// Assuming schema.JSON has an Items field for array types
 		if s.Items != nil {
-			return fmt.Sprintf("%s[]", SchemaToTS(s.Items))
+			// Array<Type> is often cleaner for complex nested objects than Type[]
+			return fmt.Sprintf("Array<%s>", SchemaToTS(s.Items, indent))
 		}
 		return "any[]"
 	case "object":
 		if len(s.Properties) > 0 {
 			var builder strings.Builder
-			builder.WriteString("{ ")
+			builder.WriteString("{\n")
+			newIndent := indent + "  "
 
-			// Create a quick lookup map for required fields
+			// quick lookup map for required fields
 			reqMap := make(map[string]bool)
 			for _, r := range s.Required {
 				reqMap[r] = true
 			}
 
-			// Sort keys for deterministic output
+			// sort keys for deterministic output
 			keys := make([]string, 0, len(s.Properties))
 			for k := range s.Properties {
 				keys = append(keys, k)
@@ -451,14 +401,26 @@ func SchemaToTS(s *schema.JSON) string {
 				if reqMap[key] {
 					opt = ""
 				}
-				builder.WriteString(fmt.Sprintf("%s%s: %s; ", key, opt, SchemaToTS(prop)))
+
+				// Format the description as an inline TS comment
+				desc := ""
+				if prop.Description != "" {
+					cleanDesc := strings.ReplaceAll(prop.Description, "\n", " ")
+					desc = fmt.Sprintf(" // %s", strings.TrimSpace(cleanDesc))
+				}
+
+				// Recursively resolve the property type
+				propType := SchemaToTS(prop, newIndent)
+
+				// Write the line: "  key?: type; // description"
+				builder.WriteString(fmt.Sprintf("%s%s%s: %s;%s\n", newIndent, key, opt, propType, desc))
 			}
-			builder.WriteString("}")
+			builder.WriteString(indent + "}")
 			return builder.String()
 		}
-		return "Record<string, any>"
+		return "Record<string, any>" // Fallback for an empty object schema
 	default:
-		return "any"
+		return "any" //TODO, if return type is set to "None" we should not get unknown!
 	}
 }
 

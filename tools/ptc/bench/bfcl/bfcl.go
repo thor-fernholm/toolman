@@ -187,7 +187,7 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 	for {
 		// trace llm call start (if not recording already)
 		if i.Tracer.ChatSpan.Span == nil || !i.Tracer.ChatSpan.IsRecording() {
-			i.Tracer.Trace(prompt.AsUser("..."), toolmanConversation, nil)
+			i.Tracer.Trace(prompt.AsAssistant("..."), toolmanConversation, nil)
 		}
 
 		start := time.Now()
@@ -345,6 +345,7 @@ func (i *Instance) executionReplay(bellmanTools []tools.Tool, toolmanConversatio
 		// trace code execution
 		jsonBytes, err := json.Marshal(result.Record.Argument)
 		if err != nil {
+			i.Tracer.TraceError(i.Tracer.ChatSpan, err)
 			log.Printf("error: error marshaling arguments: %+v, args: %+v\n", err, result.Record.Argument)
 		}
 		toolCall := prompt.AsToolCall(result.ToolID, result.Record.ToolName, jsonBytes)
@@ -442,6 +443,7 @@ func (c *Cache) ensureCache(req BenchmarkRequest) *Instance {
 			Tools:          req.Tools,
 			SystemPrompt:   req.SystemPrompt,
 			TestID:         req.TestID,
+			PTCEnabled:     req.EnablePTC,
 		})
 	}
 
