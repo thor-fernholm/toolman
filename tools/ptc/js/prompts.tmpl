@@ -22,9 +22,10 @@ Call '{{.PTCToolName}}' at most ONCE per turn. Batch all independent calls into 
 
 Example of expected batching:
 ```javascript
-var prices = getStockPrices({ tickers: ["AAPL", "GOOG"] });
-var news   = getNews({ topic: "tech" });
-{{.ReturnFunction}}({ prices, news }); // you receive this — user does not
+var user = getUser({ name: "Alice" });
+var orders = getOrders({ user_id: user.id }); // Dependent chaining
+var weather = getWeather({ city: "London" }); // Independent batching
+{{.ReturnFunction}}({ orders, weather }); // you receive this — user does not
 ```
 
 Only split across turns (REPL) if:
