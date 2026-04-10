@@ -41,10 +41,29 @@ Available '{{.PTCToolName}}' Functions:
 {{range .Signatures}}
 /**
  * {{.Description}}{{if .UnknownSchema}}
- * @returns { {{- .ReturnType -}} } (Warning: Unknown Schema){{end}}
+ * @returns { unknown } (Warning: Unknown Schema){{end}}
  */
-declare function {{.Name}}(params: {{.ArgumentType}}): {{.ReturnType}};
+declare function {{.Name}}(params: {{template "ts_node" .ArgumentNode}}): {{if .UnknownSchema}}unknown{{else}}{{template "ts_node" .ReturnNode}}{{end}};
 {{end}}
+{{end}}
+
+
+{{define "ts_node"}}
+{{- if eq .Type "object" -}}
+  {{- if .Properties -}}
+  {
+    {{- range .Properties }}
+    {{.Name}}{{if not .Required}}?{{end}}: {{template "ts_node" .}};{{if .Description}} // {{.Description}}{{end}}
+    {{- end }}
+  }
+  {{- else -}}
+  Record<string, any>
+  {{- end -}}
+{{- else if eq .Type "array" -}}
+  Array<{{template "ts_node" .Items}}>
+{{- else -}}
+  {{.Type}}
+{{- end -}}
 {{end}}
 
 

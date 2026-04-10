@@ -43,9 +43,19 @@ type TemplateData struct {
 type FunctionSignatureData struct {
 	Name          string
 	Description   string
-	ArgumentType  string
-	ReturnType    string
+	ArgumentNode  *TSNode
+	ReturnNode    *TSNode
 	UnknownSchema bool
+}
+
+// TSNode represents a node in the schema tree, formatted for template rendering.
+type TSNode struct {
+	Name        string
+	Type        string
+	Required    bool
+	Description string
+	Properties  []*TSNode // populated if Type == "object"
+	Items       *TSNode   // populated if Type == "array"
 }
 
 //go:embed prompts.tmpl
@@ -328,67 +338,81 @@ func (j *JavaScript) SystemFragment(tool ...tools.Tool) (string, error) {
 func functionSignatures(tool ...tools.Tool) []FunctionSignatureData {
 	var signatures []FunctionSignatureData
 	for _, t := range tool {
-		// Figure out return type and if schema is unknown
-		returnType := "unknown"
+		// figure out argument node
+		var argNode *TSNode
+		if t.ArgumentSchema != nil {
+			argNode = SchemaToNode("", t.ArgumentSchema, true)
+		}
+		// if no arguments, fallback to an empty object representation
+		if argNode == nil || (argNode.Type == "object" && len(argNode.Properties) == 0) {
+			argNode = &TSNode{Type: "object"}
+		}
+
+		// figure out return node
+		var returnNode *TSNode
 		unknownSchema := true
 
-		if t.ResponseSchema != nil && t.ResponseSchema.Type != "" {
-			if !(t.ResponseSchema.Type == "object" && len(t.ResponseSchema.Properties) == 0) {
-				returnType = SchemaToTS(t.ResponseSchema, "")
+		if t.ResponseSchema != nil {
+			returnNode = SchemaToNode("", t.ResponseSchema, true)
+
+			// if it is a populated schema, we safely know the shape
+			if !(returnNode.Type == "object" && len(returnNode.Properties) == 0) {
 				unknownSchema = false
 			}
 		}
-
-		// Figure out argument type
-		argType := "Record<string, any>"
-		if t.ArgumentSchema != nil && t.ArgumentSchema.Type != "" {
-			argType = SchemaToTS(t.ArgumentSchema, "")
+		// fallback: ff missing or empty, tell TS it returns `any`
+		if returnNode == nil {
+			returnNode = &TSNode{Type: "any"}
 		}
 
 		signatures = append(signatures, FunctionSignatureData{
 			Name:          escapeFunctionName(t.Name),
 			Description:   t.Description,
-			ArgumentType:  argType,
-			ReturnType:    returnType,
+			ArgumentNode:  argNode,
+			ReturnNode:    returnNode,
 			UnknownSchema: unknownSchema,
 		})
 	}
 	return signatures
 }
 
-// SchemaToTS recursively converts a JSON schema into a formatted TypeScript type string.
-// 'indent' manages formatting for deeply nested objects.
-func SchemaToTS(s *schema.JSON, indent string) string {
+// SchemaToNode recursively converts a map-based schema.JSON into a deterministic TSNode struct tree.
+// Note: ONLY data extraction, sorting, and cleaning happens here. NO formatting.
+func SchemaToNode(name string, s *schema.JSON, isRequired bool) *TSNode {
 	if s == nil {
-		return "any"
+		return &TSNode{Name: name, Type: "any", Required: isRequired}
+	}
+
+	// Clean the description for template injection
+	cleanDesc := strings.TrimSpace(strings.ReplaceAll(s.Description, "\n", " "))
+
+	node := &TSNode{
+		Name:        name,
+		Required:    isRequired,
+		Description: cleanDesc,
 	}
 
 	switch s.Type {
-	case "string":
-		return "string"
+	case "string", "boolean":
+		node.Type = string(s.Type)
 	case "integer", "number":
-		return "number"
-	case "boolean":
-		return "boolean"
+		node.Type = "number"
 	case "array":
+		node.Type = "array"
 		if s.Items != nil {
-			// Array<Type> is often cleaner for complex nested objects than Type[]
-			return fmt.Sprintf("Array<%s>", SchemaToTS(s.Items, indent))
+			node.Items = SchemaToNode("", s.Items, true)
+		} else {
+			node.Items = &TSNode{Type: "any"}
 		}
-		return "any[]"
 	case "object":
+		node.Type = "object"
 		if len(s.Properties) > 0 {
-			var builder strings.Builder
-			builder.WriteString("{\n")
-			newIndent := indent + "  "
-
-			// quick lookup map for required fields
 			reqMap := make(map[string]bool)
 			for _, r := range s.Required {
 				reqMap[r] = true
 			}
 
-			// sort keys for deterministic output
+			// must sort keys for deterministic prompt gen
 			keys := make([]string, 0, len(s.Properties))
 			for k := range s.Properties {
 				keys = append(keys, k)
@@ -396,32 +420,15 @@ func SchemaToTS(s *schema.JSON, indent string) string {
 			sort.Strings(keys)
 
 			for _, key := range keys {
-				prop := s.Properties[key]
-				opt := "?"
-				if reqMap[key] {
-					opt = ""
-				}
-
-				// Format the description as an inline TS comment
-				desc := ""
-				if prop.Description != "" {
-					cleanDesc := strings.ReplaceAll(prop.Description, "\n", " ")
-					desc = fmt.Sprintf(" // %s", strings.TrimSpace(cleanDesc))
-				}
-
-				// Recursively resolve the property type
-				propType := SchemaToTS(prop, newIndent)
-
-				// Write the line: "  key?: type; // description"
-				builder.WriteString(fmt.Sprintf("%s%s%s: %s;%s\n", newIndent, key, opt, propType, desc))
+				propReq := reqMap[key]
+				node.Properties = append(node.Properties, SchemaToNode(key, s.Properties[key], propReq))
 			}
-			builder.WriteString(indent + "}")
-			return builder.String()
 		}
-		return "Record<string, any>" // Fallback for an empty object schema
 	default:
-		return "any" //TODO, if return type is set to "None" we should not get unknown!
+		node.Type = "any" //TODO, if return type is set to "None" we should not get unknown!
 	}
+
+	return node
 }
 
 func (j *JavaScript) SetLogger(logger *slog.Logger) *JavaScript {
