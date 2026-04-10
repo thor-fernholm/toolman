@@ -336,33 +336,23 @@ func (j *JavaScript) SystemFragment(tool ...tools.Tool) (string, error) {
 }
 
 func functionSignatures(tool ...tools.Tool) []FunctionSignatureData {
-	var signatures []FunctionSignatureData
+	signatures := make([]FunctionSignatureData, 0, len(tool))
 	for _, t := range tool {
 		// figure out argument node
 		var argNode *TSNode
 		if t.ArgumentSchema != nil {
 			argNode = SchemaToNode("", t.ArgumentSchema, true)
 		}
-		// if no arguments, fallback to an empty object representation
-		if argNode == nil || (argNode.Type == "object" && len(argNode.Properties) == 0) {
-			argNode = &TSNode{Type: "object"}
-		}
 
 		// figure out return node
 		var returnNode *TSNode
 		unknownSchema := true
-
 		if t.ResponseSchema != nil {
 			returnNode = SchemaToNode("", t.ResponseSchema, true)
-
 			// if it is a populated schema, we safely know the shape
 			if !(returnNode.Type == "object" && len(returnNode.Properties) == 0) {
 				unknownSchema = false
 			}
-		}
-		// fallback: ff missing or empty, tell TS it returns `any`
-		if returnNode == nil {
-			returnNode = &TSNode{Type: "any"}
 		}
 
 		signatures = append(signatures, FunctionSignatureData{

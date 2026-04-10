@@ -37,7 +37,8 @@ Execute A, call {{.ReturnFunction}}() with its output, and STOP. Do not guess fi
 Once you have the data you need, STOP calling the tool.
 Respond to the user in plain text — never call the tool again unless new data is required.
 
-Available '{{.PTCToolName}}' Functions:
+## Available '{{.PTCToolName}}' Functions:
+```typescript
 {{range .Signatures}}
 /**
  * {{.Description}}{{if .UnknownSchema}}
@@ -45,24 +46,23 @@ Available '{{.PTCToolName}}' Functions:
  */
 declare function {{.Name}}(params: {{template "ts_node" .ArgumentNode}}): {{if .UnknownSchema}}unknown{{else}}{{template "ts_node" .ReturnNode}}{{end}};
 {{end}}
+```
 {{end}}
 
 
 {{define "ts_node"}}
 {{- if eq .Type "object" -}}
-  {{- if .Properties -}}
-  {
-    {{- range .Properties }}
-    {{.Name}}{{if not .Required}}?{{end}}: {{template "ts_node" .}};{{if .Description}} // {{.Description}}{{end}}
-    {{- end }}
-  }
-  {{- else -}}
-  Record<string, any>
-  {{- end -}}
-{{- else if eq .Type "array" -}}
-  Array<{{template "ts_node" .Items}}>
+{{- if .Properties -}}
+{
+{{range .Properties}}  {{.Name}}{{if not .Required}}?{{end}}: {{template "ts_node" .}};{{if .Description}} // {{.Description}}{{end}}
+{{end}}}
 {{- else -}}
-  {{.Type}}
+Record<string, any>
+{{- end -}}
+{{- else if eq .Type "array" -}}
+Array<{{template "ts_node" .Items}}>
+{{- else -}}
+{{.Type}}
 {{- end -}}
 {{end}}
 
