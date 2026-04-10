@@ -32,6 +32,77 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+func TestToolmanPTC(t *testing.T) {
+	// get env vars
+	err := godotenv.Load("../../../.env")
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+	bellmanUrl := os.Getenv("BELLMAN_URL")
+	bellmanToken := os.Getenv("BELLMAN_TOKEN")
+
+	enablePTC := true
+	allTools := GetMockToolmanTools(enablePTC)
+
+	// Just using the single model as you had it configured
+	models := []gen.Model{openai.GenModel_gpt4o_mini}
+
+	// create Bellman llm and run agent
+	client := bellman.New(bellmanUrl, bellman.Key{Name: "test", Token: bellmanToken})
+	llm := client.Generator().System("# Role\nYou are a helpful LLM assistant.").
+		SetTools(allTools...)
+
+	if enablePTC {
+		llm, _ = llm.ActivatePTC(ptc.JavaScript)
+	}
+
+	// ------------------------------------------------------------------------
+	// UPDATED PROMPT: Designed to trigger every single mock tool schema type
+	// ------------------------------------------------------------------------
+	userPrompt := `Please execute the following tasks in order:
+1. Do you know what PTC is (programmatic tool calling), and how LLMs call tools? If yes; answer me which tool at your disposal is PTC. If no; why not?
+2. Check the system status.
+3. Get the popular tags for the category 'ai'.
+4. Calculate the area of a circle with a radius of 5.5.
+5. Send a complex test payload to the omni-echo tool containing a string, an integer, a float, a boolean, an array of numbers, and an object, and tell me what it echoes back.
+6. Run a raw query with the SQL 'SELECT * FROM users' and summarize the dynamic data it returns.
+7. Process a test e-commerce order (ID: 123) for John Doe (john@example.com), living at 123 Main St, Stockholm, Sweden. He is buying 2 items of product 'ABC' (Color: Red, Size: L). Tell me his tracking carrier and total cost.
+8. Finally, get me the stock info (price and details) for Saab, Ericsson, and Telia.`
+
+	// stopwatch
+	start := time.Now()
+
+	// run all models
+	for _, m := range models {
+		// swap model
+		llm = llm.Model(m)
+
+		var res *agent.Result[Result]
+		switch llm.Request.Model.Provider {
+		case vertexai.Provider:
+			res, err = agent.RunWithToolsOnly[Result](10, 0, llm, prompt.AsUser(userPrompt))
+		case anthropic.Provider:
+			// haiku does not support temperature=0
+			llm.Temperature(1)
+			res, err = agent.Run[Result](10, 0, llm, prompt.AsUser(userPrompt))
+		default:
+			res, err = agent.Run[Result](10, 0, llm, prompt.AsUser(userPrompt))
+		}
+
+		if err != nil {
+			log.Printf("Prompt() error = %v", err)
+		} else {
+			for i, turn := range res.Prompts {
+				fmt.Printf("prompt %v: { role: %v, text: %v, tool_call: %v, tool_response: %v }\n", i, turn.Role, turn.Text, turn.ToolCall, turn.ToolResponse)
+			}
+			// pretty print
+			prettyPrint(res)
+			elapsed := time.Since(start)
+			fmt.Printf("Prompt took %s\n", elapsed)
+		}
+	}
+}
+
 func TestStream(t *testing.T) {
 	// get env vars
 	err := godotenv.Load("../../../.env")

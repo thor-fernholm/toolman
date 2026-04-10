@@ -56,6 +56,7 @@ type TSNode struct {
 	Description string
 	Properties  []*TSNode // populated if Type == "object"
 	Items       *TSNode   // populated if Type == "array"
+	Indent      string
 }
 
 //go:embed prompts.tmpl
@@ -341,14 +342,14 @@ func functionSignatures(tool ...tools.Tool) []FunctionSignatureData {
 		// figure out argument node
 		var argNode *TSNode
 		if t.ArgumentSchema != nil {
-			argNode = SchemaToNode("", t.ArgumentSchema, true)
+			argNode = SchemaToNode("", t.ArgumentSchema, true, "")
 		}
 
 		// figure out return node
 		var returnNode *TSNode
 		unknownSchema := true
 		if t.ResponseSchema != nil {
-			returnNode = SchemaToNode("", t.ResponseSchema, true)
+			returnNode = SchemaToNode("", t.ResponseSchema, true, "")
 			// if it is a populated schema, we safely know the shape
 			if !(returnNode.Type == "object" && len(returnNode.Properties) == 0) {
 				unknownSchema = false
@@ -368,7 +369,7 @@ func functionSignatures(tool ...tools.Tool) []FunctionSignatureData {
 
 // SchemaToNode recursively converts a map-based schema.JSON into a deterministic TSNode struct tree.
 // Note: ONLY data extraction, sorting, and cleaning happens here. NO formatting.
-func SchemaToNode(name string, s *schema.JSON, isRequired bool) *TSNode {
+func SchemaToNode(name string, s *schema.JSON, isRequired bool, currentIndent string) *TSNode {
 	if s == nil {
 		return &TSNode{Name: name, Type: "any", Required: isRequired}
 	}
@@ -380,6 +381,7 @@ func SchemaToNode(name string, s *schema.JSON, isRequired bool) *TSNode {
 		Name:        name,
 		Required:    isRequired,
 		Description: cleanDesc,
+		Indent:      currentIndent,
 	}
 
 	switch s.Type {
@@ -390,9 +392,9 @@ func SchemaToNode(name string, s *schema.JSON, isRequired bool) *TSNode {
 	case "array":
 		node.Type = "array"
 		if s.Items != nil {
-			node.Items = SchemaToNode("", s.Items, true)
+			node.Items = SchemaToNode("", s.Items, true, currentIndent)
 		} else {
-			node.Items = &TSNode{Type: "any"}
+			node.Items = &TSNode{Type: "any", Indent: currentIndent}
 		}
 	case "object":
 		node.Type = "object"
@@ -409,9 +411,10 @@ func SchemaToNode(name string, s *schema.JSON, isRequired bool) *TSNode {
 			}
 			sort.Strings(keys)
 
+			nextIndent := currentIndent + "  "
 			for _, key := range keys {
 				propReq := reqMap[key]
-				node.Properties = append(node.Properties, SchemaToNode(key, s.Properties[key], propReq))
+				node.Properties = append(node.Properties, SchemaToNode(key, s.Properties[key], propReq, nextIndent))
 			}
 		}
 	default:
