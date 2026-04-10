@@ -35,8 +35,9 @@ type resultOutput struct {
 }
 
 type TemplateData struct {
-	PTCToolName string
-	Signatures  []FunctionSignatureData
+	PTCToolName    string
+	Signatures     []FunctionSignatureData
+	ReturnFunction string
 }
 
 type FunctionSignatureData struct {
@@ -58,7 +59,8 @@ type ArgField struct {
 var templateFS embed.FS
 var parsedTemplates *template.Template
 
-const nilValue string = "null" // nil in JS
+const nilValue string = "null"          // nil in JS
+const returnFunc string = "__setResult" // define JS return value func
 
 func init() {
 	var err error
@@ -74,7 +76,7 @@ func NewRuntime(toolName string) (*JavaScript, error) {
 		mu:       sync.Mutex{},
 		toolName: toolName,
 	}
-	return javaScript.registerResult()
+	return javaScript.registerReturn()
 }
 
 func (j *JavaScript) Lock() {
@@ -129,7 +131,7 @@ func (j *JavaScript) AdaptTools(tool ...tools.Tool) (tools.Tool, error) {
 
 	// create tool description
 	var buf bytes.Buffer
-	if err := parsedTemplates.ExecuteTemplate(&buf, "ptc_tool_description", TemplateData{}); err != nil {
+	if err := parsedTemplates.ExecuteTemplate(&buf, "ptc_tool_description", TemplateData{ReturnFunction: returnFunc}); err != nil {
 		return tools.Tool{}, fmt.Errorf("failed to execute tool description template: %w", err)
 	}
 	toolDescription := buf.String()
@@ -224,12 +226,14 @@ func (j *JavaScript) Execute(ctx context.Context, code string) (resString string
 		}
 	}()
 
-	// timeout interrupt
-	timer := time.AfterFunc(10*time.Second, func() {
-		j.log("error: runtime timeout interrupt!")
-		j.runtime.Interrupt("timeout: script execution took too long (possible infinite loop)")
+	// timeout and context interrupt
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+	stop := context.AfterFunc(ctx, func() {
+		j.log("error: runtime interrupted", "error", ctx.Err())
+		j.runtime.Interrupt(fmt.Sprintf("execution interrupted: %v", ctx.Err()))
 	})
-	defer timer.Stop()
+	defer stop()
 
 	_, resErr = j.runtime.RunString(code)
 	if resErr != nil {
@@ -259,17 +263,19 @@ func escapeFunctionName(name string) string {
 	return safeName
 }
 
-// registerResult registers the result function in Goja, that returns the value from the PTC tools code
-func (j *JavaScript) registerResult() (*JavaScript, error) {
+// registerReturn registers the result function in Goja, that returns the value from the PTC tools code
+func (j *JavaScript) registerReturn() (*JavaScript, error) {
 	out := &resultOutput{}
 	j.output = out
 
-	err := j.runtime.Set("result", func(call goja.FunctionCall) goja.Value {
+	err := j.runtime.Set(returnFunc, func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) == 0 {
 			return goja.Undefined()
 		}
 		b, err := json.Marshal(call.Argument(0).Export())
 		if err != nil {
+			out.value = fmt.Sprintf(`{"error": "Failed to serialize return value: %v."}`, err)
+			out.set = true
 			return goja.Undefined()
 		}
 		out.value = string(b)
@@ -300,7 +306,7 @@ func (j *JavaScript) Guardrail(code string) (string, error) {
 		return code, errors.New("runtime error: console.log() and print() are not for returning data. use result(value) to return data")
 	}
 
-	if !strings.Contains(code, "result(") {
+	if !strings.Contains(code, fmt.Sprintf("%s(", returnFunc)) {
 		j.log("guardrail missing result()")
 		return code, errors.New("runtime error: script must call result(value) exactly once to return data. example: result({ a, b })")
 	}
@@ -313,8 +319,9 @@ func (j *JavaScript) SystemFragment(tool ...tools.Tool) (string, error) {
 	sigs := functionSignatures(tool...)
 
 	data := TemplateData{
-		PTCToolName: j.toolName,
-		Signatures:  sigs,
+		PTCToolName:    j.toolName,
+		Signatures:     sigs,
+		ReturnFunction: returnFunc,
 	}
 	var buf bytes.Buffer
 	if err := parsedTemplates.ExecuteTemplate(&buf, "ptc_system_prompt", data); err != nil {
