@@ -536,14 +536,22 @@ func executeAndExtractNestful(
 	if err != nil {
 		execSpan.RecordError(err)
 		execSpan.SetStatus(codes.Error, err.Error())
+		execSpan.SetAttributes(
+			attribute.String("toolman.execution.error_type", "syntax"),
+			attribute.Bool("toolman.execution.failed", true),
+		)
 		return captured, fmt.Sprintf("code_execution run error: %v", err)
 	}
 	if runErr != nil {
 		execSpan.RecordError(runErr)
 		execSpan.SetStatus(codes.Error, runErr.Error())
+		execSpan.SetAttributes(
+			attribute.String("toolman.execution.error_type", "run_error"),
+			attribute.Bool("toolman.execution.failed", true),
+		)
 		return captured, fmt.Sprintf("code_execution run error: %v", runErr)
 	}
-
+	attribute.Bool("toolman.execution.failed", false)
 	return captured, ""
 }
 
