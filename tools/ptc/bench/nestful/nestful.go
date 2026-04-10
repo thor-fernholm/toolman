@@ -14,7 +14,6 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	"github.com/dop251/goja"
 	"github.com/joho/godotenv"
@@ -25,6 +24,7 @@ import (
 	"github.com/modfin/bellman/services/openai"
 	"github.com/modfin/bellman/tools"
 	"github.com/modfin/bellman/tools/ptc"
+	"github.com/modfin/bellman/tools/ptc/js"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -48,6 +48,7 @@ type NestfulBenchmarkRequest struct {
 	EnablePTC          bool    `json:"enable_ptc"`
 	ToolChoice         string  `json:"tool_choice,omitempty"` // auto|required|none
 	JSExtractTimeoutMs int     `json:"js_extract_timeout_ms,omitempty"`
+	TestID             string  `json:"test_id"`
 }
 
 type NestfulBenchmarkResponse struct {
@@ -134,15 +135,26 @@ func NestfulHandler(w http.ResponseWriter, r *http.Request, client *bellman.Bell
 	tracer := otel.Tracer(fmt.Sprintf("nestful-%s-%s", ptcFlag, model.String()))
 	ctx := r.Context()
 
-	sampleID := benchSampleID(r)
-	ctx, root := tracer.Start(ctx, "nestful.request")
+	testID := req.TestID
+	ctx, root := tracer.Start(ctx, testID)
 	defer root.End()
-
+	//runKey := fmt.Sprintf("%t", req.EnablePTC)
 	root.SetAttributes(
 		attribute.String("benchmark.name", "nestful"),
-		attribute.String("benchmark.sample_id", sampleID),
 		attribute.Bool("ptc.enabled", req.EnablePTC),
 		attribute.String("tool.choice", choice),
+		attribute.String("benchmark.sample_id", req.TestID),
+		attribute.StringSlice("langfuse.trace.tags", []string{
+			"nestful",
+			req.TestID,
+			ptcFlag,
+			model.Name,
+			model.Provider,
+		}),
+
+		//attribute.String("langfuse.trace.tags",
+		//	fmt.Sprintf("%s-%s-%s/%s", req.TestID, ptcFlag, model.Provider, model.Name),
+		//),
 	)
 
 	root.SetAttributes(
@@ -376,7 +388,7 @@ func nestfulGeneratedText(ctx context.Context, tracer trace.Tracer, res *gen.Res
 				errMsgs = append(errMsgs, fmt.Sprintf("code_execution args unmarshal error: %v", err))
 				continue
 			}
-			seq, errMsg := executeAndExtractNestful(ctx, tracer, codeArgs.Code, availableTools, outKeysByTool, timeoutMs)
+			seq, errMsg := executeAndExtractNestful(ctx, tc, tracer, codeArgs.Code, availableTools, outKeysByTool, timeoutMs)
 			if errMsg != "" {
 				errMsgs = append(errMsgs, errMsg)
 			}
@@ -415,6 +427,7 @@ func nestfulGeneratedText(ctx context.Context, tracer trace.Tracer, res *gen.Res
 
 func executeAndExtractNestful(
 	ctx context.Context,
+	tc tools.Call,
 	tracer trace.Tracer,
 	jsCode string,
 	availableTools []tools.Tool,
@@ -425,55 +438,29 @@ func executeAndExtractNestful(
 		maxCapturedCalls = 15
 	)
 
-	meta := extractMeta{
-		GuardrailOK:       false,
-		CapturedCount:     0,
-		CapturedJSONTrunc: "",
-	}
-
-	vm := goja.New()
 	captured := make([]map[string]any, 0)
-
-	runtime, err := ptc.NewRuntime(ptc.JavaScript)
-	if err != nil {
-		return captured, fmt.Sprintf("failed to create ptc runtime: %v", err)
-	}
 
 	jsCode = strings.ReplaceAll(jsCode, "\\n", "\n")
 	jsCode = strings.ReplaceAll(jsCode, "\\t", "\t")
 	jsCode = strings.TrimSpace(jsCode)
 
-	guarded, guardErr := runtime.Guardrail(jsCode)
-	if guardErr != nil {
-		return captured, fmt.Sprintf("code_execution guardrail error: %v", guardErr)
-	}
-	meta.GuardrailOK = true
-
-	timer := time.AfterFunc(time.Duration(timeoutMs)*time.Millisecond, func() {
-		vm.Interrupt("timeout")
-	})
-	defer timer.Stop()
-
-	execCtx, execSpan := tracer.Start(ctx, "exec.goja")
+	execCtx, execSpan := tracer.Start(ctx, "code_execution")
 	execSpan.SetAttributes(
-		attribute.String("exec.language", "javascript"),
-		attribute.Int("exec.script_len", len(guarded)),
-		attribute.Int("exec.timeout_ms", timeoutMs),
-		attribute.Int("exec.max_captured_calls", maxCapturedCalls),
-		attribute.String("exec.script.trunc", truncate(guarded, 4000)),
+		attribute.String("gen_ai.operation.name", "execute_tool"),
+		attribute.String("gen_ai.tool.name", tc.Name),
+		attribute.String("gen_ai.tool.call.arguments", string(tc.Argument)),
+		//attribute.String("langfuse.observation.input", jsCode),
+		attribute.String("gen_ai.tool.call.id", tc.ID),
 	)
 	defer func() {
-		meta.CapturedCount = len(captured)
-		meta.CapturedJSONTrunc = truncate(string(mustJSON(captured)), 4000)
-
-		execSpan.SetAttributes(
-			attribute.Bool("exec.guardrail_ok", meta.GuardrailOK),
-			attribute.Int("captured.tool_calls", meta.CapturedCount),
-			attribute.String("captured.json", meta.CapturedJSONTrunc),
-		)
 		execSpan.End()
 	}()
 
+	runtime, err := js.NewRuntime(ptc.ToolName)
+	if err != nil {
+		log.Fatalf("NewRuntime error: %v", err)
+	}
+	vm := runtime.Runtime()
 	functionsObj := vm.NewObject()
 
 	for _, t := range availableTools {
@@ -544,17 +531,18 @@ func executeAndExtractNestful(
 	if err := vm.Set("functions", functionsObj); err != nil {
 		return captured, fmt.Sprintf("code_execution functions object error: %v", err)
 	}
-
-	if _, runErr := vm.RunString(guarded); runErr != nil {
+	//TODO add self-correction
+	_, runErr, err := runtime.Execute(jsCode)
+	if err != nil {
+		execSpan.RecordError(err)
+		execSpan.SetStatus(codes.Error, err.Error())
+		return captured, fmt.Sprintf("code_execution run error: %v", err)
+	}
+	if runErr != nil {
 		execSpan.RecordError(runErr)
 		execSpan.SetStatus(codes.Error, runErr.Error())
 		return captured, fmt.Sprintf("code_execution run error: %v", runErr)
 	}
-
-	execSpan.SetAttributes(
-		attribute.String("output.value", "ok"),
-		attribute.Int("captured.tool_calls", len(captured)),
-		attribute.String("captured.json", string(mustJSON(captured))))
 
 	return captured, ""
 }
@@ -720,13 +708,6 @@ func setupHttpLangfuse(ctx context.Context) (*sdktrace.TracerProvider, error) {
 	)
 	otel.SetTracerProvider(tp)
 	return tp, nil
-}
-
-func benchSampleID(r *http.Request) string {
-	if v := strings.TrimSpace(r.Header.Get("X-Test-Id")); v != "" {
-		return v
-	}
-	return fmt.Sprintf("%d-%s", time.Now().UnixMilli(), strings.ReplaceAll(r.RemoteAddr, ":", "_"))
 }
 
 func truncate(s string, max int) string {
