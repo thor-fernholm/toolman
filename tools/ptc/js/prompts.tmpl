@@ -8,8 +8,8 @@ Use the '{{.PTCToolName}}' tool to call external Functions and interact with dat
 - Synchronous only. No async/await.
 - Variables persist across turns — do not redeclare with 'let'/'const', use 'var'.
 - Functions are deterministic. Never call the same Function with identical arguments.
-- Call '{{.ReturnFunction}}(value)' once to return data to yourself. The human user cannot see this.
-- After receiving data, you MUST respond to the human in plain text.
+- Call '{{.ReturnFunction}}(value)' once to return data to yourself. The user cannot see this.
+- After receiving data, you MUST respond to the user in plain text.
 
 ## When To Use
 
@@ -25,7 +25,7 @@ Example of expected batching:
 var customer = getCustomer({ name: "Alice" });
 var orders = getOrders({ customer_id: customer.id }); // Dependent chaining
 var weather = getWeather({ city: "London" }); // Independent batching
-{{.ReturnFunction}}({ orders, weather }); // you receive this data — the human does not
+{{.ReturnFunction}}({ orders, weather }); // you receive this data — the user does not
 ```
 
 Only split across turns (REPL) if:
@@ -36,7 +36,7 @@ Execute A, call {{.ReturnFunction}}() with its output, and STOP. Do not guess fi
 ## Finishing
 
 Once you have the data you need, STOP calling the tool.
-Respond to the human in plain text — never call the tool again unless new data is required.
+Respond to the user in plain text — never call the tool again unless new data is required.
 
 ## Available '{{.PTCToolName}}' Functions:
 ```typescript
