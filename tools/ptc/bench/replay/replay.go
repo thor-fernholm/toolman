@@ -134,10 +134,10 @@ func (r *Replay) ExecutionReplay(tools []tools.Tool) Result {
 					return Result{Record: record, ToolID: s.ToolID}
 				}
 			}
-			// script crash
+			// script crash (set output+err)
 			if !s.Done {
 				r.Scripts[i].Done = true // index to access actual object
-				return Result{Output: fmt.Sprintf("error: %q", resErr.Error()), ToolID: s.ToolID}
+				return Result{Output: fmt.Sprintf("error: %q", resErr.Error()), ToolID: s.ToolID, Error: err}
 			}
 		}
 

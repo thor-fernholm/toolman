@@ -231,7 +231,7 @@ func (j *JavaScript) Execute(ctx context.Context, code string) (resString string
 	}()
 
 	// timeout and context interrupt
-	ctx, cancel := context.WithTimeout(ctx, 1*time.Minute) // TODO too short?
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 	stop := context.AfterFunc(ctx, func() {
 		j.log("error: runtime interrupted", "error", ctx.Err())
@@ -267,7 +267,7 @@ func escapeFunctionName(name string) string {
 	return safeName
 }
 
-// registerReturn registers the result function in Goja, that returns the value from the PTC tools code
+// registerReturn registers the custom return function in Goja, that returns the value from the PTC tools code
 func (j *JavaScript) registerReturn() (*JavaScript, error) {
 	out := &resultOutput{}
 	j.output = out
@@ -307,7 +307,7 @@ func (j *JavaScript) Guardrail(code string) (string, error) {
 
 	if strings.Contains(code, "console.log(") || strings.Contains(code, "print(") {
 		j.log("guardrail console/print usage")
-		return code, errors.New("runtime error: console.log() and print() are not for returning data. use result(value) to return data")
+		return code, errors.New("runtime error: console.log() and print() are not for returning data")
 	}
 
 	if !strings.Contains(code, fmt.Sprintf("%s(", returnFunc)) {
@@ -368,7 +368,7 @@ func functionSignatures(tool ...tools.Tool) []FunctionSignatureData {
 }
 
 // SchemaToNode recursively converts a map-based schema.JSON into a deterministic TSNode struct tree.
-// Note: ONLY data extraction, sorting, and cleaning happens here. NO formatting.
+// Note: ONLY data extraction, sorting, and cleaning happens here. NO formatting (except indentation...).
 func SchemaToNode(name string, s *schema.JSON, isRequired bool, currentIndent string) *TSNode {
 	if s == nil {
 		return &TSNode{Name: name, Type: "any", Required: isRequired}
@@ -418,7 +418,7 @@ func SchemaToNode(name string, s *schema.JSON, isRequired bool, currentIndent st
 			}
 		}
 	default:
-		node.Type = "any" //TODO, if return type is set to "None" we should not get unknown!
+		node.Type = "any"
 	}
 
 	return node
