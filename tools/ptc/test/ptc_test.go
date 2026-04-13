@@ -32,6 +32,270 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+func TestToolmanPTC(t *testing.T) {
+	// get env vars
+	err := godotenv.Load("../../../.env")
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+	bellmanUrl := os.Getenv("BELLMAN_URL")
+	bellmanToken := os.Getenv("BELLMAN_TOKEN")
+
+	enablePTC := true
+	allTools := GetMockToolmanTools(enablePTC)
+
+	// Just using the single model as you had it configured
+	models := []gen.Model{openai.GenModel_gpt4o_mini}
+
+	// create Bellman llm and run agent
+	client := bellman.New(bellmanUrl, bellman.Key{Name: "test", Token: bellmanToken})
+	llm := client.Generator().System("# Role\nYou are a helpful LLM assistant.").
+		SetTools(allTools...)
+
+	if enablePTC {
+		llm, _ = llm.ActivatePTC(ptc.JavaScript)
+	}
+
+	// ------------------------------------------------------------------------
+	// UPDATED PROMPT: Designed to trigger every single mock tool schema type
+	// ------------------------------------------------------------------------
+	userPrompt := `Please execute the following tasks in order:
+1. Do you know what PTC is (programmatic tool calling), and how LLMs call tools? If yes; answer me which tool at your disposal is PTC. If no; why not?
+2. Check the system status.
+3. Get the popular tags for the category 'ai'.
+4. Calculate the area of a circle with a radius of 5.5.
+5. Send a complex test payload to the omni-echo tool containing a string, an integer, a float, a boolean, an array of numbers, and an object, and tell me what it echoes back.
+6. Run a raw query with the SQL 'SELECT * FROM users' and summarize the dynamic data it returns.
+7. Process a test e-commerce order (ID: 123) for John Doe (john@example.com), living at 123 Main St, Stockholm, Sweden. He is buying 2 items of product 'ABC' (Color: Red, Size: L). Tell me his tracking carrier and total cost.
+8. Finally, get me the stock info (price and details) for Saab, Ericsson, and Telia.`
+
+	// stopwatch
+	start := time.Now()
+
+	// run all models
+	for _, m := range models {
+		// swap model
+		llm = llm.Model(m)
+
+		var res *agent.Result[Result]
+		switch llm.Request.Model.Provider {
+		case vertexai.Provider:
+			res, err = agent.RunWithToolsOnly[Result](10, 0, llm, prompt.AsUser(userPrompt))
+		case anthropic.Provider:
+			// haiku does not support temperature=0
+			llm.Temperature(1)
+			res, err = agent.Run[Result](10, 0, llm, prompt.AsUser(userPrompt))
+		default:
+			res, err = agent.Run[Result](10, 0, llm, prompt.AsUser(userPrompt))
+		}
+
+		if err != nil {
+			log.Printf("Prompt() error = %v", err)
+		} else {
+			for i, turn := range res.Prompts {
+				fmt.Printf("prompt %v: { role: %v, text: %v, tool_call: %v, tool_response: %v }\n", i, turn.Role, turn.Text, turn.ToolCall, turn.ToolResponse)
+			}
+			// pretty print
+			prettyPrint(res)
+			elapsed := time.Since(start)
+			fmt.Printf("Prompt took %s\n", elapsed)
+		}
+	}
+}
+
+func TestStream(t *testing.T) {
+	// get env vars
+	err := godotenv.Load("../../../.env")
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+	bellmanUrl := os.Getenv("BELLMAN_URL")
+	bellmanToken := os.Getenv("BELLMAN_TOKEN")
+
+	enablePTC := true
+	allTools := GetMockBellmanTools(enablePTC)
+	model := openai.GenModel_gpt5_mini_latest
+
+	// create Bellman llm and run agent
+	client := bellman.New(bellmanUrl, bellman.Key{Name: "test", Token: bellmanToken})
+	llm := client.Generator().System("# Role\nYou are a helpful LLM assistant.").
+		SetTools(allTools...).ThinkingBudget(100) //.Temperature(0)
+
+	if enablePTC {
+		llm, _ = llm.ActivatePTC(ptc.JavaScript)
+	}
+
+	userPrompt := "1. Do you know what PTC is (programmatic tool calling), and how LLMs call tools? If yes; answer me which tool at your disposal is PTC. If no; why not?"
+	userPrompt += "2. Predict the future, 3. convert 69 usd to sek, and then 4. generate a secret password. "
+
+	prompts := []prompt.Prompt{prompt.AsUser(userPrompt)}
+
+	// stopwatch
+	start := time.Now()
+
+	// swap model
+	llm = llm.Model(model)
+	res, err := llm.Prompt(prompts...)
+	if err != nil {
+		log.Fatalf("Prompt() error = %v", err)
+	}
+	fmt.Printf("----Prompt result: %v\n", res)
+
+	// exec and add new tool calls!
+	newPrompts := getResponse(res)
+	prompts = append(prompts, newPrompts...)
+
+	prompts = append(prompts, prompt.AsUser("also, 5. get me the stock info (price/details) for saab, ericsson, and telia."))
+
+	streamChan, err := llm.Stream(prompts...)
+	if err != nil {
+		log.Fatalf("Stream() error = %v", err)
+	}
+
+	// get stream res, exec tool calls and add prompts
+	streamRes := getStreamResult(streamChan)
+	newPrompts = getResponse(streamRes)
+	prompts = append(prompts, newPrompts...)
+
+	// new prompt
+	prompts = append(prompts, prompt.AsUser("also, 5. get me the stock info (price/details) for google and apple."))
+
+	// stream again...
+	streamChan, err = llm.Stream(prompts...)
+	if err != nil {
+		log.Fatalf("Stream() error = %v", err)
+	}
+
+	// exec tool calls and add prompts
+	streamRes = getStreamResult(streamChan)
+	newPrompts = getResponse(streamRes)
+	prompts = append(prompts, newPrompts...)
+
+	// new prompt
+	prompts = append(prompts, prompt.AsUser("make an analytic comparison of saab and ericsson stocks."))
+
+	// stream again...
+	streamChan, err = llm.Stream(prompts...)
+	if err != nil {
+		log.Fatalf("Stream() error = %v", err)
+	}
+
+	// exec tool calls and add prompts
+	streamRes = getStreamResult(streamChan)
+	newPrompts = getResponse(streamRes)
+	prompts = append(prompts, newPrompts...)
+
+	//
+	for i, m := range prompts {
+		fmt.Printf("prompt %v: { role: %v, text: %v, tool_call: %v, tool_response: %v }\n", i, m.Role, m.Text, m.ToolCall, m.ToolResponse)
+	}
+
+	elapsed := time.Since(start)
+	fmt.Printf("Prompt took %s", elapsed)
+}
+
+// getStreamResult gets a tool call or assistant text response
+func getStreamResult(streamChan <-chan *gen.StreamResponse) *gen.Response {
+	fmt.Println("\n----Streaming result:")
+	var tName string
+	var tRef *tools.Tool
+	var tArgs []byte
+	var tId string
+	var content string
+	for chunk := range streamChan {
+		if chunk.Error() != nil {
+			log.Fatalf("\nError during stream: %v", chunk.Error())
+		}
+
+		// Print the chunk without a newline so it flows naturally
+		if chunk.Role == prompt.AssistantRole {
+			content += chunk.Content
+		}
+
+		if chunk.Role == prompt.ToolCallRole {
+			tName = chunk.ToolCall.Name
+			tArgs = append(tArgs, chunk.ToolCall.Argument...)
+			tRef = chunk.ToolCall.Ref
+			tId = chunk.ToolCall.ID
+		}
+	}
+	fmt.Printf("toolname: %s\ntoolargs: %v", tName, string(tArgs))
+	fmt.Println()
+
+	if content != "" && tRef == nil {
+		resStream := &gen.Response{
+			Texts: []string{content},
+		}
+		return resStream
+	}
+
+	toolCall := tools.Call{
+		ID:       tId,
+		Name:     tName,
+		Argument: tArgs,
+		Ref:      tRef,
+	}
+
+	resStream := &gen.Response{
+		Tools: []tools.Call{toolCall},
+	}
+	return resStream
+}
+
+func getResponse(res *gen.Response) []prompt.Prompt {
+	if !res.IsTools() {
+		text, err := res.AsText()
+		if err != nil {
+			log.Fatalf("res as text error")
+		}
+		return []prompt.Prompt{prompt.AsAssistant(text)}
+	}
+
+	ctx := context.Background()
+	type callbackResult struct {
+		Index    int
+		ID       string
+		Name     string
+		Response string
+		Error    error
+	}
+
+	var results []callbackResult
+	for i, callback := range res.Tools {
+		//call := t.
+		// Pre-validate all callbacks before execution
+		if callback.Ref == nil {
+			log.Fatalf("tool %s not found in local setup", callback.Name)
+		}
+		if callback.Ref.Function == nil {
+			log.Fatalf("tool %s has no callback function attached", callback.Name)
+		}
+
+		response, err := callback.Ref.Function(ctx, callback)
+		results = append(results, callbackResult{
+			Index:    i,
+			ID:       callback.ID,
+			Name:     callback.Name,
+			Response: response,
+			Error:    err,
+		})
+	}
+
+	// Process results and check for errors
+	var prompts []prompt.Prompt
+	for _, cbResult := range results {
+		callback := res.Tools[cbResult.Index]
+		prompts = append(prompts, prompt.AsToolCall(callback.ID, callback.Name, callback.Argument))
+
+		if cbResult.Error != nil {
+			log.Fatalf("tool %s failed: %s, arg: %s", cbResult.Name, cbResult.Error, callback.Argument)
+		}
+
+		prompts = append(prompts, prompt.AsToolResponse(cbResult.ID, cbResult.Name, cbResult.Response))
+	}
+	return prompts
+}
+
 func TestOpenTelemetry(t *testing.T) {
 	// get env vars
 	err := godotenv.Load("../../../.env")

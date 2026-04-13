@@ -87,6 +87,16 @@ The runtime can be reset by recreating it:
 //TODO
 ```
 
+### Guardrails & Timeouts
+
+The code execution runtime has a set of guardrails defined in code, that wil return an error string (that the llm can use to rewrite code), to prevent unwanted behaviour.
+Some guardrails include no "async" methods, no "print()" or "console.log()", and always use "return" function.
+
+To further guard the system, a timeout interruption for code execution is used. Currently, it is set to 3 minutes.
+This should for example prevent infinite loops, but might be too short for complex tool usage.
+
+To change or update these behaviours, see [javascript.go](js/javascript.go).
+
 ## Benchmarking
 
 Toolman includes a benchmarking suite to evaluate LLM performance on tool-calling tasks, specifically focusing on PTC capabilities.

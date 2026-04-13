@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 type JavaScript struct {
 	runtime  *goja.Runtime
 	mu       sync.Mutex
+	ctx      context.Context // set during Execute, used by tool wrappers
 	toolName string
 	output   *resultOutput
 	Log      *slog.Logger `json:"-"`
@@ -33,30 +35,36 @@ type resultOutput struct {
 }
 
 type TemplateData struct {
-	PTCToolName string
-	Signatures  []FunctionSignatureData
+	PTCToolName    string
+	Signatures     []FunctionSignatureData
+	ReturnFunction string
 }
 
 type FunctionSignatureData struct {
 	Name          string
 	Description   string
-	Args          []ArgField
-	ReturnType    string
+	ArgumentNode  *TSNode
+	ReturnNode    *TSNode
 	UnknownSchema bool
 }
 
-type ArgField struct {
+// TSNode represents a node in the schema tree, formatted for template rendering.
+type TSNode struct {
 	Name        string
 	Type        string
 	Required    bool
 	Description string
+	Properties  []*TSNode // populated if Type == "object"
+	Items       *TSNode   // populated if Type == "array"
+	Indent      string
 }
 
 //go:embed prompts.tmpl
 var templateFS embed.FS
 var parsedTemplates *template.Template
 
-const nilValue string = "null" // nil in JS
+const nilValue string = "null"          // nil in JS
+const returnFunc string = "__setResult" // define JS return value func
 
 func init() {
 	var err error
@@ -72,7 +80,7 @@ func NewRuntime(toolName string) (*JavaScript, error) {
 		mu:       sync.Mutex{},
 		toolName: toolName,
 	}
-	return javaScript.registerResult()
+	return javaScript.registerReturn()
 }
 
 func (j *JavaScript) Lock() {
@@ -112,7 +120,7 @@ func (j *JavaScript) AdaptTools(tool ...tools.Tool) (tools.Tool, error) {
 			return "", err
 		}
 
-		res, resErr, err := j.Execute(arg.Code)
+		res, resErr, err := j.Execute(ctx, arg.Code)
 		if err != nil {
 			return res, err
 		}
@@ -127,7 +135,7 @@ func (j *JavaScript) AdaptTools(tool ...tools.Tool) (tools.Tool, error) {
 
 	// create tool description
 	var buf bytes.Buffer
-	if err := parsedTemplates.ExecuteTemplate(&buf, "ptc_tool_description", TemplateData{}); err != nil {
+	if err := parsedTemplates.ExecuteTemplate(&buf, "ptc_tool_description", TemplateData{ReturnFunction: returnFunc}); err != nil {
 		return tools.Tool{}, fmt.Errorf("failed to execute tool description template: %w", err)
 	}
 	toolDescription := buf.String()
@@ -144,17 +152,18 @@ func (j *JavaScript) AdaptTools(tool ...tools.Tool) (tools.Tool, error) {
 
 // bindToolFunction wraps a Bellman tool as a runtime function: toolName({ args... })
 func (j *JavaScript) bindToolFunction(tool tools.Tool) error {
+	escapedName := escapeFunctionName(tool.Name)
 	wrapper := func(call goja.FunctionCall) goja.Value {
 		// check if LLM passed multiple arguments (common mistake)
 		if len(call.Arguments) > 1 {
 			errMsg := fmt.Sprintf("Error: %s expects a single configuration object argument, but received %d arguments. Usage: %s({ key: val })",
-				tool.Name, len(call.Arguments), tool.Name)
+				escapedName, len(call.Arguments), escapedName)
 			return j.runtime.ToValue(map[string]string{"error": errMsg})
 		}
 
 		// extract runtime argument (expecting a single object)
 		if len(call.Arguments) == 0 {
-			return j.runtime.NewGoError(fmt.Errorf("tool %s requires arguments", tool.Name))
+			return j.runtime.NewGoError(fmt.Errorf("tool %s requires arguments", escapedName))
 		}
 		jsArgs := call.Argument(0).Export()
 
@@ -165,7 +174,11 @@ func (j *JavaScript) bindToolFunction(tool tools.Tool) error {
 		}
 
 		// execute the actual go tool
-		res, err := tool.Function(context.Background(), tools.Call{
+		ctx := j.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		res, err := tool.Function(ctx, tools.Call{
 			Argument: jsonArgs,
 		})
 		if err != nil {
@@ -186,7 +199,7 @@ func (j *JavaScript) bindToolFunction(tool tools.Tool) error {
 	j.Lock()
 	defer j.Unlock()
 
-	err := j.runtime.Set(tool.Name, wrapper)
+	err := j.runtime.Set(escapedName, wrapper)
 	if err != nil {
 		return err
 	}
@@ -195,15 +208,18 @@ func (j *JavaScript) bindToolFunction(tool tools.Tool) error {
 }
 
 // Execute runs a code script in the runtime, uses same error handling as LLM (runtime errors return string!)
-func (j *JavaScript) Execute(code string) (resString string, resErr error, err error) {
+func (j *JavaScript) Execute(ctx context.Context, code string) (resString string, resErr error, err error) {
 	code, resErr = j.Guardrail(code)
 	if resErr != nil {
 		return "", resErr, nil
 	}
-	j.output.set = false // reset output
-
 	j.Lock()
 	defer j.Unlock()
+
+	j.output.set = false // reset output
+
+	j.ctx = ctx
+	defer func() { j.ctx = nil }()
 
 	// panic recovery
 	defer func() {
@@ -214,12 +230,14 @@ func (j *JavaScript) Execute(code string) (resString string, resErr error, err e
 		}
 	}()
 
-	// timeout interrupt
-	timer := time.AfterFunc(10*time.Second, func() {
-		j.log("error: runtime timeout interrupt!")
-		j.runtime.Interrupt("timeout: script execution took too long (possible infinite loop)")
+	// timeout and context interrupt
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	stop := context.AfterFunc(ctx, func() {
+		j.log("error: runtime interrupted", "error", ctx.Err())
+		j.runtime.Interrupt(fmt.Sprintf("execution interrupted: %v", ctx.Err()))
 	})
-	defer timer.Stop()
+	defer stop()
 
 	_, resErr = j.runtime.RunString(code)
 	if resErr != nil {
@@ -235,17 +253,33 @@ func (j *JavaScript) Execute(code string) (resString string, resErr error, err e
 	return nilValue, nil, nil
 }
 
-// registerResult registers the result function in Goja, that returns the value from the PTC tools code
-func (j *JavaScript) registerResult() (*JavaScript, error) {
+// Matches anything that IS NOT a letter, number, underscore, or dollar sign
+var invalidJSFuncSymbols = regexp.MustCompile(`[^a-zA-Z0-9_$]`)
+
+func escapeFunctionName(name string) string {
+	safeName := invalidJSFuncSymbols.ReplaceAllString(name, "_")
+
+	// JS identifiers cannot start with a number
+	if len(safeName) > 0 && safeName[0] >= '0' && safeName[0] <= '9' {
+		safeName = "_" + safeName
+	}
+
+	return safeName
+}
+
+// registerReturn registers the custom return function in Goja, that returns the value from the PTC tools code
+func (j *JavaScript) registerReturn() (*JavaScript, error) {
 	out := &resultOutput{}
 	j.output = out
 
-	err := j.runtime.Set("result", func(call goja.FunctionCall) goja.Value {
+	err := j.runtime.Set(returnFunc, func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) == 0 {
 			return goja.Undefined()
 		}
 		b, err := json.Marshal(call.Argument(0).Export())
 		if err != nil {
+			out.value = fmt.Sprintf(`{"error": "Failed to serialize return value: %v."}`, err)
+			out.set = true
 			return goja.Undefined()
 		}
 		out.value = string(b)
@@ -273,10 +307,10 @@ func (j *JavaScript) Guardrail(code string) (string, error) {
 
 	if strings.Contains(code, "console.log(") || strings.Contains(code, "print(") {
 		j.log("guardrail console/print usage")
-		return code, errors.New("runtime error: console.log() and print() are not for returning data. use result(value) to return data")
+		return code, errors.New("runtime error: console.log() and print() are not for returning data")
 	}
 
-	if !strings.Contains(code, "result(") {
+	if !strings.Contains(code, fmt.Sprintf("%s(", returnFunc)) {
 		j.log("guardrail missing result()")
 		return code, errors.New("runtime error: script must call result(value) exactly once to return data. example: result({ a, b })")
 	}
@@ -289,8 +323,9 @@ func (j *JavaScript) SystemFragment(tool ...tools.Tool) (string, error) {
 	sigs := functionSignatures(tool...)
 
 	data := TemplateData{
-		PTCToolName: j.toolName,
-		Signatures:  sigs,
+		PTCToolName:    j.toolName,
+		Signatures:     sigs,
+		ReturnFunction: returnFunc,
 	}
 	var buf bytes.Buffer
 	if err := parsedTemplates.ExecuteTemplate(&buf, "ptc_system_prompt", data); err != nil {
@@ -302,133 +337,91 @@ func (j *JavaScript) SystemFragment(tool ...tools.Tool) (string, error) {
 }
 
 func functionSignatures(tool ...tools.Tool) []FunctionSignatureData {
-	var signatures []FunctionSignatureData
+	signatures := make([]FunctionSignatureData, 0, len(tool))
 	for _, t := range tool {
-		// Figure out return type and if schema is unknown
-		returnType := "unknown"
-		unknownSchema := true
+		// figure out argument node
+		var argNode *TSNode
+		if t.ArgumentSchema != nil {
+			argNode = SchemaToNode("", t.ArgumentSchema, true, "")
+		}
 
-		if t.ResponseSchema != nil && t.ResponseSchema.Type != "" {
-			if !(t.ResponseSchema.Type == "object" && len(t.ResponseSchema.Properties) == 0) {
-				returnType = SchemaToTS(t.ResponseSchema)
+		// figure out return node
+		var returnNode *TSNode
+		unknownSchema := true
+		if t.ResponseSchema != nil {
+			returnNode = SchemaToNode("", t.ResponseSchema, true, "")
+			// if it is a populated schema, we safely know the shape
+			if !(returnNode.Type == "object" && len(returnNode.Properties) == 0) {
 				unknownSchema = false
 			}
 		}
 
 		signatures = append(signatures, FunctionSignatureData{
-			Name:          t.Name,
+			Name:          escapeFunctionName(t.Name),
 			Description:   t.Description,
-			Args:          extractArgs(t.ArgumentSchema),
-			ReturnType:    returnType,
+			ArgumentNode:  argNode,
+			ReturnNode:    returnNode,
 			UnknownSchema: unknownSchema,
 		})
 	}
 	return signatures
 }
 
-func extractArgs(s *schema.JSON) []ArgField {
-	if s == nil || len(s.Properties) == 0 {
-		return nil
-	}
-
-	required := map[string]bool{}
-	for _, r := range s.Required {
-		required[r] = true
-	}
-
-	var args []ArgField
-	for name, prop := range s.Properties {
-		cleanDesc := strings.ReplaceAll(prop.Description, "\n", " ")
-		cleanDesc = strings.TrimSpace(cleanDesc)
-
-		args = append(args, ArgField{
-			Name:        name,
-			Type:        mapJSONSchemaType(prop),
-			Required:    required[name],
-			Description: cleanDesc,
-		})
-	}
-
-	sort.Slice(args, func(i, j int) bool {
-		return args[i].Name < args[j].Name
-	})
-
-	return args
-}
-
-func mapJSONSchemaType(s *schema.JSON) string {
+// SchemaToNode recursively converts a map-based schema.JSON into a deterministic TSNode struct tree.
+// Note: ONLY data extraction, sorting, and cleaning happens here. NO formatting (except indentation...).
+func SchemaToNode(name string, s *schema.JSON, isRequired bool, currentIndent string) *TSNode {
 	if s == nil {
-		return "unknown"
+		return &TSNode{Name: name, Type: "any", Required: isRequired}
+	}
+
+	// Clean the description for template injection
+	cleanDesc := strings.TrimSpace(strings.ReplaceAll(s.Description, "\n", " "))
+
+	node := &TSNode{
+		Name:        name,
+		Required:    isRequired,
+		Description: cleanDesc,
+		Indent:      currentIndent,
 	}
 
 	switch s.Type {
-	case "string":
-		return "string"
-	case "number", "integer":
-		return "number"
-	case "boolean":
-		return "boolean"
-	case "array":
-		return "any[]"
-	case "object":
-		return "object"
-	default:
-		return "unknown"
-	}
-}
-
-// SchemaToTS recursively converts a bellman schema.JSON into a TypeScript type string
-func SchemaToTS(s *schema.JSON) string {
-	if s == nil {
-		return "any"
-	}
-
-	switch s.Type {
-	case "string":
-		return "string"
+	case "string", "boolean":
+		node.Type = string(s.Type)
 	case "integer", "number":
-		return "number"
-	case "boolean":
-		return "boolean"
+		node.Type = "number"
 	case "array":
-		// Assuming schema.JSON has an Items field for array types
+		node.Type = "array"
 		if s.Items != nil {
-			return fmt.Sprintf("%s[]", SchemaToTS(s.Items))
+			node.Items = SchemaToNode("", s.Items, true, currentIndent)
+		} else {
+			node.Items = &TSNode{Type: "any", Indent: currentIndent}
 		}
-		return "any[]"
 	case "object":
+		node.Type = "object"
 		if len(s.Properties) > 0 {
-			var builder strings.Builder
-			builder.WriteString("{ ")
-
-			// Create a quick lookup map for required fields
 			reqMap := make(map[string]bool)
 			for _, r := range s.Required {
 				reqMap[r] = true
 			}
 
-			// Sort keys for deterministic output
+			// must sort keys for deterministic prompt gen
 			keys := make([]string, 0, len(s.Properties))
 			for k := range s.Properties {
 				keys = append(keys, k)
 			}
 			sort.Strings(keys)
 
+			nextIndent := currentIndent + "  "
 			for _, key := range keys {
-				prop := s.Properties[key]
-				opt := "?"
-				if reqMap[key] {
-					opt = ""
-				}
-				builder.WriteString(fmt.Sprintf("%s%s: %s; ", key, opt, SchemaToTS(prop)))
+				propReq := reqMap[key]
+				node.Properties = append(node.Properties, SchemaToNode(key, s.Properties[key], propReq, nextIndent))
 			}
-			builder.WriteString("}")
-			return builder.String()
 		}
-		return "Record<string, any>"
 	default:
-		return "any"
+		node.Type = "any"
 	}
+
+	return node
 }
 
 func (j *JavaScript) SetLogger(logger *slog.Logger) *JavaScript {

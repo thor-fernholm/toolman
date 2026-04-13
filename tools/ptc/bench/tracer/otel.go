@@ -48,6 +48,7 @@ type TracerRequest struct {
 	Tools          []interface{}   `json:"tools"`
 	SystemPrompt   string          `json:"system_prompt"`
 	TestID         string          `json:"test_id"`
+	PTCEnabled     bool            `json:"ptc_enabled"`
 }
 
 type Metrics struct {
@@ -82,24 +83,29 @@ func (t *Tracer) Trace(p prompt.Prompt, messages []prompt.Prompt, metrics *Metri
 				attribute.String("gen_ai.input.messages", string(jsonConversation)),
 				attribute.String("gen_ai.prompt", p.Text),
 				attribute.String("gen_ai.tool.definitions", t.ToolString),
+				attribute.String("bench.span_type", "step"),
 			)
 		}
 	case prompt.AssistantRole:
 		if chatSpan.Span == nil || !chatSpan.IsRecording() {
 			chatSpan.Context, chatSpan.Span = t.Tracer.Start(t.TurnSpan.Context, fmt.Sprintf("chat %s", t.Model.Name))
 			// add input message conversation
-			//jsonResponse, _ := json.MarshalIndent(messages, "", "  ")
+			jsonConversation, _ := json.MarshalIndent(messages, "", "  ")
 			chatSpan.SetAttributes(
 				attribute.String("gen_ai.operation.name", "chat"),
 				attribute.String("gen_ai.provider.name", t.Model.Provider),
 				attribute.String("gen_ai.response.model", t.Model.Name),
-				//attribute.String("gen_ai.output.messages", string(jsonResponse)),
+				attribute.String("gen_ai.input.messages", string(jsonConversation)),
 				attribute.String("gen_ai.prompt", fmt.Sprintf("Conversation history...")),
+				attribute.String("gen_ai.tool.definitions", t.ToolString),
+				attribute.String("bench.span_type", "step"),
 			)
-		} else if chatSpan.Span != nil {
+			break
+		} else if chatSpan.Span != nil && chatSpan.IsRecording() {
 			chatSpan.SetAttributes(
 				attribute.String("gen_ai.completion", p.Text),
 			)
+			t.SetTag(chatSpan, "assistant")
 			if metrics != nil {
 				chatSpan.SetAttributes(
 					attribute.Int("gen_ai.usage.input_tokens", metrics.InputTokens),
@@ -113,13 +119,14 @@ func (t *Tracer) Trace(p prompt.Prompt, messages []prompt.Prompt, metrics *Metri
 		chatSpan.End()
 		time.Sleep(1 * time.Millisecond) // sleep 1ms to enforce otel order
 	case prompt.ToolCallRole:
-		if chatSpan.Span != nil {
-			// add input message conversation
+		if chatSpan.Span != nil && chatSpan.IsRecording() {
+			// add llm output messages
 			jsonResponse, _ := json.MarshalIndent(messages, "", "  ")
 			chatSpan.SetAttributes(
 				attribute.String("gen_ai.output.messages", string(jsonResponse)),
-				attribute.String("gen_ai.completion", "Tool Calls Requested"),
+				attribute.String("gen_ai.completion", "Tool Calls"),
 			)
+			t.SetTag(chatSpan, "tool_call")
 			if metrics != nil {
 				chatSpan.SetAttributes(
 					attribute.Int("gen_ai.usage.input_tokens", metrics.InputTokens),
@@ -140,11 +147,12 @@ func (t *Tracer) Trace(p prompt.Prompt, messages []prompt.Prompt, metrics *Metri
 			attribute.String("gen_ai.tool.name", p.ToolCall.Name),
 			attribute.String("gen_ai.tool.call.arguments", string(p.ToolCall.Arguments)),
 			attribute.String("gen_ai.tool.call.id", p.ToolCall.ToolCallID),
+			attribute.String("bench.span_type", "tool"),
 		)
 		t.ToolSpans[p.ToolCall.ToolCallID] = toolSpan
 	case prompt.ToolResponseRole:
 		toolSpan = t.ToolSpans[p.ToolResponse.ToolCallID]
-		if toolSpan.Span != nil {
+		if toolSpan.Span != nil && toolSpan.IsRecording() {
 			// The tool finished executing! Log the result and close the chatSpan.
 			toolSpan.SetAttributes(
 				attribute.String("gen_ai.tool.call.result", p.ToolResponse.Response),
@@ -172,9 +180,10 @@ func (t *Tracer) TraceExec(p prompt.Prompt) {
 			attribute.String("gen_ai.tool.name", p.ToolCall.Name),
 			attribute.String("gen_ai.tool.call.arguments", string(p.ToolCall.Arguments)),
 			attribute.String("gen_ai.tool.call.id", p.ToolCall.ToolCallID),
+			attribute.String("bench.span_type", "execution"),
 		)
 	case prompt.ToolResponseRole:
-		if execSpan.Span != nil {
+		if execSpan.Span != nil && execSpan.IsRecording() {
 			// The tool finished executing! Log the result and close the chatSpan.
 			execSpan.SetAttributes(
 				attribute.String("gen_ai.tool.call.result", p.ToolResponse.Response),
@@ -188,15 +197,23 @@ func (t *Tracer) TraceExec(p prompt.Prompt) {
 }
 
 // TraceError traces an error on a span and sends all spans
-func (t *Tracer) TraceError(span Span, err error) {
+func (t *Tracer) TraceError(span Span, err error, end bool) {
 	// Catch the error, record it in otel, and cleanly close the trace!
 	if span.Span != nil && span.IsRecording() {
 		// This adds a red error badge to the span in Langfuse
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 	}
-	// Force close the entire test trace so it exports properly
-	t.SendTrace(true)
+	if end {
+		// Force close the entire test trace so it exports properly
+		t.SendTrace(true)
+	}
+}
+
+func (t *Tracer) SetTag(span Span, tag string) {
+	if span.Span != nil && span.IsRecording() {
+		span.SetAttributes(attribute.String("bench.span_tag", tag))
+	}
 }
 
 // NewTrace setup new trace
@@ -226,8 +243,15 @@ func (t *Tracer) NewTrace(req TracerRequest) {
 	// By reassigning to 'ctx', all future spans will become children of this trace.
 	t.RootSpan.Context, t.RootSpan.Span = t.Tracer.Start(ctx, fmt.Sprintf("%s", req.TestID))
 
+	ptc_tag := "regular-fc"
+	if req.PTCEnabled {
+		ptc_tag = "ptc-fc"
+	}
+
 	t.RootSpan.SetAttributes(
 		attribute.String("gen_ai.system_instructions", req.SystemPrompt),
+		attribute.StringSlice("langfuse.trace.tags", []string{req.TestID, ptc_tag, req.Model}), // Important: tag for metric filtering "<test_id>-<ptc_enabled>-<model_name>"
+		attribute.String("bench.span_type", "test"),
 	)
 }
 
@@ -235,6 +259,11 @@ func (t *Tracer) NewTrace(req TracerRequest) {
 func (t *Tracer) NewTurn() {
 	t.SendTrace(false)
 	t.TurnSpan.Context, t.TurnSpan.Span = t.Tracer.Start(t.RootSpan.Context, fmt.Sprintf("turn_%d", t.Turn))
+	t.TurnSpan.SetAttributes(
+		attribute.String("bench.span_type", "turn"),
+		attribute.Int("bench.turn_number", t.Turn),
+	)
+
 	t.Turn++
 }
 
