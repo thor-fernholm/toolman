@@ -27,7 +27,8 @@ type BenchmarkRequest struct {
 	NewToolResponses []Message       `json:"new_tool_responses"`
 	ToolmanHistory   []prompt.Prompt `json:"toolman_history"`
 	Tools            []interface{}   `json:"tools"`
-	Temperature      float64         `json:"temperature"`
+	Temperature      *float64        `json:"temperature"`
+	Thinking         *int            `json:"thinking"`
 	SystemPrompt     string          `json:"system_prompt"`
 	EnablePTC        bool            `json:"enable_ptc"`
 	TestID           string          `json:"test_entry_id"`
@@ -178,7 +179,15 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 
 	llm := client.Generator().Model(model).
 		System(req.SystemPrompt).
-		SetTools(bellmanTools...) //.Temperature(req.Temperature)
+		SetTools(bellmanTools...)
+
+	// default or set temp/think
+	if req.Temperature != nil {
+		llm = llm.Temperature(*req.Temperature)
+	}
+	if req.Thinking != nil {
+		llm = llm.ThinkingBudget(*req.Thinking)
+	}
 
 	if req.EnablePTC {
 		llm, err = llm.ActivatePTC(ptc.JavaScript)

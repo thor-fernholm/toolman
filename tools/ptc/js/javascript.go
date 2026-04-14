@@ -157,7 +157,7 @@ func (j *JavaScript) bindToolFunction(tool tools.Tool) error {
 		// go panic to goja exception recovery
 		defer func() {
 			if r := recover(); r != nil {
-				panic(j.runtime.ToValue(fmt.Sprintf("critical native function panic: %v", r))) // native refers to Go!
+				panic(j.runtime.NewGoError(fmt.Errorf("critical native function panic: %v", r))) // native refers to Go!
 			}
 		}()
 
