@@ -11,6 +11,260 @@ import (
 	"github.com/modfin/bellman/tools"
 )
 
+// GetMockToolmanTools returns ready-to-use dummy Bellman tools covering all schema types
+func GetMockToolmanTools(enablePTC bool) []tools.Tool {
+	var mockTools []tools.Tool
+
+	// ---------------------------------------------------------
+	// 1. OBJECT IN -> OBJECT OUT (Linked Tools)
+	// ---------------------------------------------------------
+	type CompanyArgs struct {
+		Name string `json:"name"`
+	}
+	type CompanyData struct {
+		ID          string `json:"company_id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Domain      string `json:"domain"`
+		Valuation   string `json:"valuation"`
+	}
+	companyTool := tools.NewTool("get_company",
+		tools.WithDescription("Gets company object by name. Returns id, description, domain, and valuation."),
+		tools.WithArgSchema(CompanyArgs{}),
+		tools.WithPTC(enablePTC),
+		tools.WithResponseType[CompanyData](),
+		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
+			var arg CompanyArgs
+			if err := json.Unmarshal(call.Argument, &arg); err != nil {
+				return "", err
+			}
+			query := strings.ToLower(strings.TrimSpace(arg.Name))
+			var data CompanyData
+			if strings.Contains(query, "saab") {
+				data = CompanyData{ID: "comp_saab_001", Name: "Saab AB", Domain: "saab.com"}
+			} else {
+				return `{"error": "Not found"}`, nil
+			}
+			b, _ := json.Marshal(data)
+			return string(b), nil
+		}),
+	)
+	mockTools = append(mockTools, companyTool)
+
+	type StockArgs struct {
+		CompanyId string `json:"company_id"`
+	}
+	type StockData struct {
+		Symbol string  `json:"symbol"`
+		Price  float64 `json:"price"`
+	}
+	stockTool := tools.NewTool("get_stock",
+		tools.WithDescription("Gets stock price by company id."),
+		tools.WithArgSchema(StockArgs{}),
+		tools.WithPTC(enablePTC),
+		tools.WithResponseType[StockData](),
+		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
+			var arg StockArgs
+			if err := json.Unmarshal(call.Argument, &arg); err != nil {
+				return "", err
+			}
+			data := StockData{Symbol: "SAAB B", Price: 785.50}
+			b, _ := json.Marshal(data)
+			return string(b), nil
+		}),
+	)
+	mockTools = append(mockTools, stockTool)
+
+	// ---------------------------------------------------------
+	// 2. EMPTY IN -> BOOLEAN OUT
+	// ---------------------------------------------------------
+	type EmptyArgs struct{} // Will generate an empty object schema {}
+
+	statusTool := tools.NewTool("get_system_status",
+		tools.WithDescription("Checks if the backend system is currently online. Requires no parameters."),
+		tools.WithArgSchema(EmptyArgs{}),
+		tools.WithPTC(enablePTC),
+		tools.WithResponseType[bool](), // Tests boolean return
+		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
+			// Returns raw JSON boolean
+			return "true", nil
+		}),
+	)
+	mockTools = append(mockTools, statusTool)
+
+	// ---------------------------------------------------------
+	// 3. PRIMITIVE IN -> ARRAY OUT
+	// ---------------------------------------------------------
+	type TagArgs struct {
+		Category string `json:"category"`
+	}
+
+	tagsTool := tools.NewTool("get_popular_tags",
+		tools.WithDescription("Returns a list of popular tags for a given category."),
+		tools.WithArgSchema(TagArgs{}),
+		tools.WithPTC(enablePTC),
+		tools.WithResponseType[[]string](), // Tests Array return
+		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
+			tags := []string{"tech", "ai", "golang", "typescript"}
+			b, _ := json.Marshal(tags)
+			return string(b), nil
+		}),
+	)
+	mockTools = append(mockTools, tagsTool)
+
+	// ---------------------------------------------------------
+	// 4. OBJECT IN -> NUMBER OUT
+	// ---------------------------------------------------------
+	type MathArgs struct {
+		Radius float64 `json:"radius"`
+	}
+
+	mathTool := tools.NewTool("calculate_circle_area",
+		tools.WithDescription("Calculates the area of a circle given its radius."),
+		tools.WithArgSchema(MathArgs{}),
+		tools.WithPTC(enablePTC),
+		tools.WithResponseType[float64](), // Tests Number/Float return
+		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
+			var arg MathArgs
+			if err := json.Unmarshal(call.Argument, &arg); err != nil {
+				return "", err
+			}
+			area := 3.14159 * arg.Radius * arg.Radius
+			// Returns raw JSON number
+			return fmt.Sprintf("%f", area), nil
+		}),
+	)
+	mockTools = append(mockTools, mathTool)
+
+	// ---------------------------------------------------------
+	// 5. THE OMNI-TOOL: ALL TYPES IN -> ALL TYPES OUT
+	// ---------------------------------------------------------
+	type OmniArgs struct {
+		StrVal   string            `json:"str_val"`
+		IntVal   int               `json:"int_val"`
+		FloatVal float64           `json:"float_val"`
+		BoolVal  bool              `json:"bool_val"`
+		ArrVal   []int             `json:"arr_val"`
+		ObjVal   map[string]string `json:"obj_val"`
+	}
+
+	omniTool := tools.NewTool("echo_omni_types",
+		tools.WithDescription("Echoes back exactly what you send it. Used to test complex nested types."),
+		tools.WithArgSchema(OmniArgs{}),
+		tools.WithPTC(enablePTC),
+		tools.WithResponseType[OmniArgs](), // Tests massive complex schema
+		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
+			// Whatever the LLM sends, we just bounce it right back
+			return string(call.Argument), nil
+		}),
+	)
+	mockTools = append(mockTools, omniTool)
+
+	// ---------------------------------------------------------
+	// 6. OBJECT IN -> UNKNOWN SCHEMA OUT
+	// ---------------------------------------------------------
+	type QueryArgs struct {
+		Sql string `json:"sql"`
+	}
+
+	rawTool := tools.NewTool("run_raw_query",
+		tools.WithDescription("Executes a raw query and returns dynamic unstructured data."),
+		tools.WithArgSchema(QueryArgs{}),
+		tools.WithPTC(enablePTC),
+		// NOTE: Intentionally missing tools.WithResponseType[]() to test the fallback!
+		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
+			// Return a dynamic JSON string that the LLM has no schema for
+			return `{"dynamic_key_1": "val1", "dynamic_nested": {"foo": "bar"}}`, nil
+		}),
+	)
+	mockTools = append(mockTools, rawTool)
+
+	// ---------------------------------------------------------
+	// 7. DEEP RECURSION: NESTED STRUCTS IN & OUT
+	// ---------------------------------------------------------
+	type ItemOptions struct {
+		Color string `json:"color"`
+		Size  string `json:"size"`
+	}
+	type OrderItem struct {
+		ProductID string      `json:"product_id"`
+		Quantity  int         `json:"quantity"`
+		Options   ItemOptions `json:"options"`
+	}
+	type Address struct {
+		Street  string `json:"street"`
+		City    string `json:"city"`
+		Country string `json:"country"`
+	}
+	type Customer struct {
+		Name    string  `json:"name"`
+		Email   string  `json:"email"`
+		Address Address `json:"address"`
+	}
+	type OrderRequest struct {
+		OrderID  string      `json:"order_id"`
+		Customer Customer    `json:"customer"`
+		Items    []OrderItem `json:"items"`
+	}
+
+	type Waypoint struct {
+		Location  string `json:"location"`
+		Timestamp string `json:"timestamp"`
+	}
+	type TrackingDetails struct {
+		Carrier           string     `json:"carrier"`
+		EstimatedDelivery string     `json:"estimated_delivery"`
+		Waypoints         []Waypoint `json:"waypoints"`
+	}
+	type OrderSummary struct {
+		Subtotal float64 `json:"subtotal"`
+		Tax      float64 `json:"tax"`
+		Total    float64 `json:"total"`
+	}
+	type OrderReceipt struct {
+		Status   string          `json:"status"`
+		Tracking TrackingDetails `json:"tracking"`
+		Summary  OrderSummary    `json:"summary"`
+	}
+
+	orderTool := tools.NewTool("process_ecommerce_order",
+		tools.WithDescription("Processes a complex e-commerce order containing nested customer data and item arrays."),
+		tools.WithArgSchema(OrderRequest{}),
+		tools.WithPTC(enablePTC),
+		tools.WithResponseType[OrderReceipt](),
+		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
+			var arg OrderRequest
+			if err := json.Unmarshal(call.Argument, &arg); err != nil {
+				return "", err
+			}
+
+			// Mock a successful receipt generation based on the deeply nested input
+			receipt := OrderReceipt{
+				Status: "Processed successfully for " + arg.Customer.Name,
+				Tracking: TrackingDetails{
+					Carrier:           "PostNord",
+					EstimatedDelivery: "Tomorrow",
+					Waypoints: []Waypoint{
+						{Location: "Stockholm Hub", Timestamp: "08:00 AM"},
+						{Location: "Out for delivery", Timestamp: "09:30 AM"},
+					},
+				},
+				Summary: OrderSummary{
+					Subtotal: 99.00,
+					Tax:      24.75,
+					Total:    123.75,
+				},
+			}
+
+			b, _ := json.Marshal(receipt)
+			return string(b), nil
+		}),
+	)
+	mockTools = append(mockTools, orderTool)
+
+	return mockTools
+}
+
 // GetMockBellmanTools returns ready-to-use dummy Bellman tools
 func GetMockBellmanTools(enablePTC bool) []tools.Tool {
 	var mockTools []tools.Tool

@@ -150,7 +150,7 @@ func (i *Instance) replayGenerateCFB(w http.ResponseWriter, req BenchmarkRequest
 
 	model, err := gen.ToModel(req.Model)
 	if err != nil {
-		i.Tracer.TraceError(i.Tracer.RootSpan, err)
+		i.Tracer.TraceError(i.Tracer.RootSpan, err, true)
 		log.Fatalf("error: %e", err)
 	}
 
@@ -208,7 +208,7 @@ func (i *Instance) replayGenerateCFB(w http.ResponseWriter, req BenchmarkRequest
 	for {
 		// trace llm call start (if not recording already)
 		if i.Tracer.ChatSpan.Span == nil || !i.Tracer.ChatSpan.IsRecording() {
-			i.Tracer.Trace(prompt.AsUser(""), toolmanConversation, nil)
+			i.Tracer.Trace(prompt.AsAssistant(""), toolmanConversation, nil)
 		}
 
 		start := time.Now()
@@ -230,12 +230,13 @@ func (i *Instance) replayGenerateCFB(w http.ResponseWriter, req BenchmarkRequest
 
 		if i.retries >= maxRetries {
 			log.Printf("Prompt Error: %+v\n", err)
-			i.Tracer.TraceError(i.Tracer.ChatSpan, err)
+			i.Tracer.TraceError(i.Tracer.ChatSpan, err, true)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// trace error as assistant
+		i.Tracer.TraceError(i.Tracer.ChatSpan, err, false)
 		i.Tracer.Trace(prompt.AsAssistant(err.Error()), toolmanConversation, nil)
 
 		// update retry counter
@@ -285,7 +286,7 @@ func (i *Instance) replayGenerateCFB(w http.ResponseWriter, req BenchmarkRequest
 	toolmanCalls, cfbCalls, err := i.getToolCalls(res)
 	if err != nil {
 		log.Printf("error getting prompts: %v", err)
-		i.Tracer.TraceError(i.Tracer.ChatSpan, err)
+		i.Tracer.TraceError(i.Tracer.ChatSpan, err, true)
 
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -314,7 +315,7 @@ func (i *Instance) replayGenerateCFB(w http.ResponseWriter, req BenchmarkRequest
 	if res.IsText() {
 		if content, err = res.AsText(); err != nil {
 			log.Printf("error: %v", err)
-			i.Tracer.TraceError(i.Tracer.ChatSpan, err)
+			i.Tracer.TraceError(i.Tracer.ChatSpan, err, true)
 
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -412,7 +413,12 @@ func (i *Instance) getToolCalls(res *gen.Response) ([]prompt.Prompt, []ToolCall,
 func (i *Instance) executionReplay(bellmanTools []tools.Tool, toolmanConversation []prompt.Prompt, genResponse *gen.Response, model gen.Model) (*BenchmarkResponse, *prompt.Prompt) {
 	result := i.Replay.ExecutionReplay(bellmanTools)
 	if result.Error != nil {
-		log.Fatalf("error: %e", result.Error)
+		if result.Output != "" { // runtime error
+			i.Tracer.SetTag(i.Tracer.ChatSpan, "runtime_error")
+		} else {
+			i.Tracer.TraceError(i.Tracer.ChatSpan, result.Error, true)
+			log.Fatalf("execution replay error: %+v", result.Error)
+		}
 	}
 
 	// record --> bench tool call
@@ -555,6 +561,7 @@ func (c *Cache) ensureCache(req BenchmarkRequest) *Instance {
 			Tools:          req.Tools,
 			SystemPrompt:   req.SystemPrompt,
 			TestID:         req.TestID,
+			PTCEnabled:     req.EnablePTC,
 		})
 	}
 

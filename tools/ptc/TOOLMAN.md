@@ -2,7 +2,7 @@
 
 Toolman introduces Programmatic Tool-Calling (PTC), allowing LLMs to write and execute code (e.g., JavaScript) to interact with tools. This enables complex logic, loops, and data manipulation that standard single-turn tool calling struggles with.
 
-### Usage
+## Usage
 
 To use PTC, you need to define your tools and set the PTC language on the generator.
 
@@ -17,15 +17,15 @@ type Response struct {
 }
 
 type Quote struct {
-   Character string `json:"character"`
-   Quote string `json:"quote"`
+    Character string `json:"character"`
+    Quote string `json:"quote"`
 }
 
 ptcTool := tools.NewTool("get_quote",
    tool.WithPTC(true), // <-- Enable PTC
    tools.WithDescription(
       "a function to get a quote from a person or character in Hamlet", 
-	  ),
+      ),
    tool.WithArgSchema(args{}),
    tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
          var arg Args
@@ -45,29 +45,58 @@ tools = append(tools, ptcTool)
 
 // Initialize llm
 llm := client.Generator().
-   Model(openai.GenModel_gpt4o).
-   SetTools(tools). // set tools as usual
+	Model(openai.GenModel_gpt4o).
+	WithContext(context.Background()).
+	SetTools(tools). // set tools as usual
 
 llm, err := llm.ActivatePTC(ptc.JavaScript) // <-- Activate PTC (on enabled tools) and select language
 if err != nil {
-   log.Fatalf("ActivatePTC() error = %v", err)
+    log.Fatalf("ActivatePTC() error = %v", err)
 }
 
 res, err := llm.Prompt(prompt.AsUser("Give me 3 quotes from different characters"))
 
 if err != nil {
-   log.Fatalf("Prompt() error = %v", err)
+    log.Fatalf("Prompt() error = %v", err)
 }
 
 // Evaluate with callback function
 err = res.Eval()
 if err != nil {
-   log.Fatalf("Eval() error = %v", err)
+    log.Fatalf("Eval() error = %v", err)
 }
 
 ```
 
 For documentation on how to use Bellman, please refer to the Bellman [README.md](../../README.md).
+
+### Custom PTC System Prompt
+
+When guiding the model for using PTC, a PTC system fragment is added to the system prompt.
+The default PTC system fragment can be overwritten:
+```go
+//TODO
+```
+
+### Statefulness
+
+The code execution runtime is stateful! it is up to the developer to utilize or destroy state in a practical manner.
+Statefulness is often practical even for stateless LLM APIs,and standard for LLMs code execution sandboxes.
+
+The runtime can be reset by recreating it:
+```go
+//TODO
+```
+
+### Guardrails & Timeouts
+
+The code execution runtime has a set of guardrails defined in code, that wil return an error string (that the llm can use to rewrite code), to prevent unwanted behaviour.
+Some guardrails include no "async" methods, no "print()" or "console.log()", and always use "return" function.
+
+To further guard the system, a timeout interruption for code execution is used. Currently, it is set to 3 minutes.
+This should for example prevent infinite loops, but might be too short for complex tool usage.
+
+To change or update these behaviours, see [javascript.go](js/javascript.go).
 
 ## Benchmarking
 

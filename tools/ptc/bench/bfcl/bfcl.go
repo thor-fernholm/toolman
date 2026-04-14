@@ -27,7 +27,8 @@ type BenchmarkRequest struct {
 	NewToolResponses []Message       `json:"new_tool_responses"`
 	ToolmanHistory   []prompt.Prompt `json:"toolman_history"`
 	Tools            []interface{}   `json:"tools"`
-	Temperature      float64         `json:"temperature"`
+	Temperature      *float64        `json:"temperature"`
+	Thinking         *int            `json:"thinking"`
 	SystemPrompt     string          `json:"system_prompt"`
 	EnablePTC        bool            `json:"enable_ptc"`
 	TestID           string          `json:"test_entry_id"`
@@ -124,7 +125,7 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 
 	model, err := gen.ToModel(req.Model)
 	if err != nil {
-		i.Tracer.TraceError(i.Tracer.RootSpan, err)
+		i.Tracer.TraceError(i.Tracer.RootSpan, err, true)
 		log.Fatalf("to model error: %e", err)
 	}
 
@@ -137,6 +138,13 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 					ToolName: m.ToolName,
 					Result:   m.Content,
 				})
+				// track tool error
+				if checkResponseError(m.Content) {
+					toolSpan, ok := i.Tracer.ToolSpans[m.ToolID]
+					if ok {
+						i.Tracer.SetTag(toolSpan, "tool_error")
+					}
+				}
 				// trace code execution
 				toolResponse := prompt.AsToolResponse(m.ToolID, m.ToolName, m.Content)
 				i.Tracer.TraceExec(toolResponse)
@@ -171,7 +179,15 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 
 	llm := client.Generator().Model(model).
 		System(req.SystemPrompt).
-		SetTools(bellmanTools...) //.Temperature(req.Temperature)
+		SetTools(bellmanTools...)
+
+	// default or set temp/think
+	if req.Temperature != nil {
+		llm = llm.Temperature(*req.Temperature)
+	}
+	if req.Thinking != nil {
+		llm = llm.ThinkingBudget(*req.Thinking)
+	}
 
 	if req.EnablePTC {
 		llm, err = llm.ActivatePTC(ptc.JavaScript)
@@ -187,7 +203,7 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 	for {
 		// trace llm call start (if not recording already)
 		if i.Tracer.ChatSpan.Span == nil || !i.Tracer.ChatSpan.IsRecording() {
-			i.Tracer.Trace(prompt.AsUser("..."), toolmanConversation, nil)
+			i.Tracer.Trace(prompt.AsAssistant("..."), toolmanConversation, nil)
 		}
 
 		start := time.Now()
@@ -195,26 +211,24 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 		duration := time.Since(start)
 		fmt.Printf("prompt duration: %v ms\n", duration.Milliseconds())
 
-		if res != nil {
+		if err == nil && res != nil {
 			metrics = &tracer.Metrics{
 				InputTokens:    res.Metadata.InputTokens,
 				OutputTokens:   res.Metadata.OutputTokens,
 				ThinkingTokens: res.Metadata.ThinkingTokens,
 			}
-		}
-
-		if err == nil {
 			break
 		}
 
 		if i.retries >= maxRetries {
 			log.Printf("Prompt Error: %+v\n", err)
-			i.Tracer.TraceError(i.Tracer.ChatSpan, err)
+			i.Tracer.TraceError(i.Tracer.ChatSpan, err, true)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// trace error as assistant
+		i.Tracer.TraceError(i.Tracer.ChatSpan, err, false)
 		i.Tracer.Trace(prompt.AsAssistant(err.Error()), toolmanConversation, metrics)
 
 		// update retries counter
@@ -245,7 +259,7 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 	toolmanCalls, bfclCalls, bfclToolIDs, err := i.getToolCalls(res)
 	if err != nil {
 		log.Printf("error getting prompts: %v", err)
-		i.Tracer.TraceError(i.Tracer.ChatSpan, err)
+		i.Tracer.TraceError(i.Tracer.ChatSpan, err, true)
 
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -337,8 +351,12 @@ func (i *Instance) getToolCalls(res *gen.Response) ([]prompt.Prompt, []Extracted
 func (i *Instance) executionReplay(bellmanTools []tools.Tool, toolmanConversation []prompt.Prompt, genResponse *gen.Response) (*BenchmarkResponse, *prompt.Prompt) {
 	result := i.Replay.ExecutionReplay(bellmanTools)
 	if result.Error != nil {
-		i.Tracer.TraceError(i.Tracer.ChatSpan, result.Error)
-		log.Fatalf("execution replay error: %+v", result.Error)
+		if result.Output != "" { // runtime error
+			i.Tracer.SetTag(i.Tracer.ChatSpan, "runtime_error")
+		} else {
+			i.Tracer.TraceError(i.Tracer.ChatSpan, result.Error, true)
+			log.Fatalf("execution replay error: %+v", result.Error)
+		}
 	}
 
 	// record --> bench tool call
@@ -348,6 +366,7 @@ func (i *Instance) executionReplay(bellmanTools []tools.Tool, toolmanConversatio
 		// trace code execution
 		jsonBytes, err := json.Marshal(result.Record.Argument)
 		if err != nil {
+			i.Tracer.TraceError(i.Tracer.ChatSpan, err, false)
 			log.Printf("error: error marshaling arguments: %+v, args: %+v\n", err, result.Record.Argument)
 		}
 		toolCall := prompt.AsToolCall(result.ToolID, result.Record.ToolName, jsonBytes)
@@ -445,6 +464,7 @@ func (c *Cache) ensureCache(req BenchmarkRequest) *Instance {
 			Tools:          req.Tools,
 			SystemPrompt:   req.SystemPrompt,
 			TestID:         req.TestID,
+			PTCEnabled:     req.EnablePTC,
 		})
 	}
 
@@ -467,6 +487,23 @@ func (c *Cache) finish(testID string) {
 		i.Tracer.SendTrace(true)
 		i.Replay.Clear()
 	}
+}
+
+func checkResponseError(res string) bool {
+	type BFCLError struct {
+		Error string `json:"error"`
+	}
+
+	var bfclResp BFCLError
+	err := json.Unmarshal([]byte(res), &bfclResp)
+	if err != nil {
+		return false
+	}
+
+	if bfclResp.Error != "" {
+		return true
+	}
+	return false
 }
 
 // addNewUserConversation adds incoming user messages to toolman conversation
