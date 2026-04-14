@@ -154,6 +154,13 @@ func (j *JavaScript) AdaptTools(tool ...tools.Tool) (tools.Tool, error) {
 func (j *JavaScript) bindToolFunction(tool tools.Tool) error {
 	escapedName := escapeFunctionName(tool.Name)
 	wrapper := func(call goja.FunctionCall) goja.Value {
+		// go panic to goja exception recovery
+		defer func() {
+			if r := recover(); r != nil {
+				panic(j.runtime.ToValue(fmt.Sprintf("critical native function panic: %v", r))) // native refers to Go!
+			}
+		}()
+
 		// check if LLM passed multiple arguments (common mistake)
 		if len(call.Arguments) > 1 {
 			errMsg := fmt.Sprintf("Error: %s expects a single configuration object argument, but received %d arguments. Usage: %s({ key: val })",
@@ -218,14 +225,18 @@ func (j *JavaScript) Execute(ctx context.Context, code string) (resString string
 
 	j.output.set = false // reset output
 
+	// get or sanitize context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	j.ctx = ctx
 	defer func() { j.ctx = nil }()
 
 	// panic recovery
 	defer func() {
 		if r := recover(); r != nil {
-			j.log("error: runtime panic! recovering.")
-			resErr = fmt.Errorf("critical runtime panic: %v", r)
+			j.log("error: fatal runtime panic! recovering.", "panic", r)
+			resErr = fmt.Errorf("fatal runtime panic: %v", r)
 			err = nil
 		}
 	}()
@@ -241,6 +252,13 @@ func (j *JavaScript) Execute(ctx context.Context, code string) (resString string
 
 	_, resErr = j.runtime.RunString(code)
 	if resErr != nil {
+		// catch goja exception
+		var jsErr *goja.Exception
+		if errors.As(resErr, &jsErr) {
+			j.log("error: script execution failed", "details", jsErr.String())
+			return "", fmt.Errorf("JavaScript error:\n%s", jsErr.String()), nil
+		}
+
 		j.log("error: runtime error!")
 		return "", resErr, nil
 	}
