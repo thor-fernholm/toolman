@@ -187,6 +187,7 @@ func (j *JavaScript) bindToolFunction(tool tools.Tool) error {
 			ctx = context.Background()
 		}
 		res, err := tool.Function(ctx, tools.Call{
+			Name:     tool.Name,
 			Argument: jsonArgs,
 		})
 		if err != nil {
