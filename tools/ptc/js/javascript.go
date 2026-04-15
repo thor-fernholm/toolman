@@ -54,6 +54,7 @@ type TSNode struct {
 	Type        string
 	Required    bool
 	Description string
+	Format      string
 	Properties  []*TSNode // populated if Type == "object"
 	Items       *TSNode   // populated if Type == "array"
 	Indent      string
@@ -395,11 +396,31 @@ func SchemaToNode(name string, s *schema.JSON, isRequired bool, currentIndent st
 	// Clean the description for template injection
 	cleanDesc := strings.TrimSpace(strings.ReplaceAll(s.Description, "\n", " "))
 
+	format := ""
+	if s.Format != nil {
+		format = *s.Format
+	}
+
 	node := &TSNode{
 		Name:        name,
 		Required:    isRequired,
 		Description: cleanDesc,
+		Format:      format,
 		Indent:      currentIndent,
+	}
+
+	// handle enums
+	if len(s.Enum) > 0 {
+		var literals []string
+		for _, val := range s.Enum {
+			if strVal, ok := val.(string); ok {
+				literals = append(literals, fmt.Sprintf(`"%s"`, strVal)) // Quotes for strings
+			} else {
+				literals = append(literals, fmt.Sprintf(`%v`, val)) // Fallback for numbers
+			}
+		}
+		node.Type = strings.Join(literals, " | ")
+		return node // Enum is primitive leaf node, return early
 	}
 
 	switch s.Type {

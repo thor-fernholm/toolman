@@ -55,7 +55,7 @@ declare function {{.Name}}(params: {{template "ts_node" .ArgumentNode}}): {{if .
 {{- if eq .Type "object" -}}
 {{- if .Properties -}}
 {
-{{range .Properties}}{{.Indent}}{{.Name}}{{if not .Required}}?{{end}}: {{template "ts_node" .}};{{if .Description}} // {{.Description}}{{end}}
+{{range .Properties}}{{.Indent}}{{.Name}}{{if not .Required}}?{{end}}: {{template "ts_node" .}};{{if or .Description .Format}} // {{if .Description}}{{.Description}}{{end}}{{if and .Description .Format}} | {{end}}{{if .Format}}Format: {{.Format}}{{end}}{{end}}
 {{end}}{{.Indent}}}
 {{- else -}}
 Record<string, any>
