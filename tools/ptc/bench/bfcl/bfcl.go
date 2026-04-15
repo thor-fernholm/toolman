@@ -19,6 +19,8 @@ import (
 	"github.com/modfin/bellman/tools/ptc/bench/replay"
 	"github.com/modfin/bellman/tools/ptc/bench/tracer"
 	"github.com/modfin/bellman/tools/ptc/bench/utils"
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
 )
 
 type BenchmarkRequest struct {
@@ -73,8 +75,9 @@ func NewCache() *Cache {
 }
 
 var (
-	GlobalInputTokens  uint64
-	GlobalOutputTokens uint64
+	GlobalInputTokens    uint64
+	GlobalOutputTokens   uint64
+	GlobalThinkingTokens uint64
 )
 
 // HandleGenerateBFCL is the handler for the BFCL benchmark
@@ -584,13 +587,16 @@ func logExecution(res *gen.Response) {
 	// extract tokens and update global counters
 	inputTokens := res.Metadata.InputTokens
 	outputTokens := res.Metadata.OutputTokens
+	thinkingTokens := res.Metadata.ThinkingTokens
 
 	// Thread-safe increment
 	atomic.AddUint64(&GlobalInputTokens, uint64(inputTokens))
 	atomic.AddUint64(&GlobalOutputTokens, uint64(outputTokens))
+	atomic.AddUint64(&GlobalThinkingTokens, uint64(thinkingTokens))
 
 	// Log the running total to the console
-	fmt.Printf("[Token Stats] Request: %d / %d | Global Total: %d / %d\n",
-		inputTokens, outputTokens,
-		atomic.LoadUint64(&GlobalInputTokens), atomic.LoadUint64(&GlobalOutputTokens))
+	p := message.NewPrinter(language.English)
+	p.Printf("[Token Stats] Request: %d in / %d think / %d out | Global Total: %d in / %d think / %d out\n",
+		inputTokens, thinkingTokens, outputTokens,
+		atomic.LoadUint64(&GlobalInputTokens), atomic.LoadUint64(&GlobalThinkingTokens), atomic.LoadUint64(&GlobalOutputTokens))
 }

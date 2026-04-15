@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"regexp"
 	"syscall"
 	"time"
 
@@ -243,16 +244,23 @@ func (t *Tracer) NewTrace(req TracerRequest) {
 	// By reassigning to 'ctx', all future spans will become children of this trace.
 	t.RootSpan.Context, t.RootSpan.Span = t.Tracer.Start(ctx, fmt.Sprintf("%s", req.TestID))
 
-	ptc_tag := "regular-fc"
+	ptcTag := "regular-fc"
 	if req.PTCEnabled {
-		ptc_tag = "ptc-fc"
+		ptcTag = "ptc-fc"
 	}
+	categoryTag := ExtractCategoryRegex(req.TestID)
 
 	t.RootSpan.SetAttributes(
 		attribute.String("gen_ai.system_instructions", req.SystemPrompt),
-		attribute.StringSlice("langfuse.trace.tags", []string{req.TestID, ptc_tag, req.Model}), // Important: tag for metric filtering "<test_id>-<ptc_enabled>-<model_name>"
+		attribute.StringSlice("langfuse.trace.tags", []string{categoryTag, ptcTag, req.Model}), // Important: tag for metric filtering "<test_category>-<ptc_enabled>-<model_name>"
 		attribute.String("bench.span_type", "test"),
 	)
+}
+
+var categoryRegex = regexp.MustCompile(`(?:_\d+)+$`)
+
+func ExtractCategoryRegex(testID string) string {
+	return categoryRegex.ReplaceAllString(testID, "")
 }
 
 // NewTurn starts a new turn span

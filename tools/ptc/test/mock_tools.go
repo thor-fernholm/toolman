@@ -11,6 +11,34 @@ import (
 	"github.com/modfin/bellman/tools"
 )
 
+func GetMockTool(enablePTC bool) []tools.Tool {
+	// ---------------------------------------------------------
+	// 5. THE OMNI-TOOL: ALL TYPES IN -> ALL TYPES OUT
+	// ---------------------------------------------------------
+	type Enum struct {
+		Types *[]string `json-enum:"hej,nej,okej"`
+		Other *string   `json-enum:"help,me,please"`
+	}
+
+	type OmniArgs struct {
+		Enum    Enum   `json:"enum_val,omitempty"`
+		Format  string `json:"format" json-format:"DD-MM-YYY"`
+		Test123 string `json:"test,omitempty" json-format:"email" json-description:"bla bla bla"`
+	}
+
+	omniTool := tools.NewTool("echo_omni_types",
+		tools.WithDescription("Echoes back exactly what you send it. Used to test complex nested types."),
+		tools.WithArgSchema(OmniArgs{}),
+		tools.WithPTC(enablePTC),
+		tools.WithResponseType[OmniArgs](), // Tests massive complex schema
+		tools.WithFunction(func(ctx context.Context, call tools.Call) (string, error) {
+			// Whatever the LLM sends, we just bounce it right back
+			return string(call.Argument), nil
+		}),
+	)
+	return []tools.Tool{omniTool}
+}
+
 // GetMockToolmanTools returns ready-to-use dummy Bellman tools covering all schema types
 func GetMockToolmanTools(enablePTC bool) []tools.Tool {
 	var mockTools []tools.Tool
@@ -139,6 +167,10 @@ func GetMockToolmanTools(enablePTC bool) []tools.Tool {
 	// ---------------------------------------------------------
 	// 5. THE OMNI-TOOL: ALL TYPES IN -> ALL TYPES OUT
 	// ---------------------------------------------------------
+	type Enum struct {
+		Types *[]string `json-enum:"hej,nej,okej"`
+	}
+
 	type OmniArgs struct {
 		StrVal   string            `json:"str_val"`
 		IntVal   int               `json:"int_val"`
@@ -146,6 +178,7 @@ func GetMockToolmanTools(enablePTC bool) []tools.Tool {
 		BoolVal  bool              `json:"bool_val"`
 		ArrVal   []int             `json:"arr_val"`
 		ObjVal   map[string]string `json:"obj_val"`
+		Enum     Enum              `json:"enum"`
 	}
 
 	omniTool := tools.NewTool("echo_omni_types",

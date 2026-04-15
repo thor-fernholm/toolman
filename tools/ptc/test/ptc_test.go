@@ -494,14 +494,15 @@ func TestToolman(t *testing.T) {
 	bellmanToken := os.Getenv("BELLMAN_TOKEN")
 
 	enablePTC := true
-	allTools := GetMockBellmanTools(enablePTC)
+	//allTools := GetMockBellmanTools(enablePTC)
+	allTools := GetMockTool(enablePTC)
 	models := []gen.Model{openai.GenModel_gpt4o_mini, vertexai.GenModel_gemini_2_5_flash_latest, anthropic.GenModel_3_haiku_20240307}
 	models = []gen.Model{openai.GenModel_gpt5_mini_latest}
 
 	// create Bellman llm and run agent
 	client := bellman.New(bellmanUrl, bellman.Key{Name: "test", Token: bellmanToken})
 	llm := client.Generator().System("# Role\nYou are a helpful LLM assistant.").
-		SetTools(allTools...).ThinkingBudget(100) //.Temperature(0)
+		SetTools(allTools...) //.ThinkingBudget(100) //.Temperature(0)
 
 	if enablePTC {
 		llm, _ = llm.ActivatePTC(ptc.JavaScript)

@@ -532,7 +532,7 @@ func executeAndExtractNestful(
 		return captured, fmt.Sprintf("code_execution functions object error: %v", err)
 	}
 	//TODO add self-correction
-	_, runErr, err := runtime.Execute(jsCode)
+	_, runErr, err := runtime.Execute(ctx, jsCode)
 	if err != nil {
 		execSpan.RecordError(err)
 		execSpan.SetStatus(codes.Error, err.Error())
