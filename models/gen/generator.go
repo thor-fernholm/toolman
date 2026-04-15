@@ -132,6 +132,7 @@ func (b *Generator) Tools() []tools.Tool {
 
 func (b *Generator) SetTools(tool ...tools.Tool) *Generator {
 	bb := b.clone()
+
 	bb.Request.Tools = append([]tools.Tool{}, tool...)
 	return bb
 }
