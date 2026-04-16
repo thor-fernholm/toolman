@@ -55,6 +55,8 @@ type TSNode struct {
 	Required    bool
 	Description string
 	Format      string
+	Min         string
+	Max         string
 	Properties  []*TSNode // populated if Type == "object"
 	Items       *TSNode   // populated if Type == "array"
 	Indent      string
@@ -402,11 +404,21 @@ func SchemaToNode(name string, s *schema.JSON, isRequired bool, currentIndent st
 		format = *s.Format
 	}
 
+	minVal, maxVal := "", ""
+	if s.Minimum != nil {
+		minVal = fmt.Sprintf("%v", *s.Minimum)
+	}
+	if s.Maximum != nil {
+		maxVal = fmt.Sprintf("%v", *s.Maximum)
+	}
+
 	node := &TSNode{
 		Name:        name,
 		Required:    isRequired,
 		Description: cleanDesc,
 		Format:      format,
+		Min:         minVal,
+		Max:         maxVal,
 		Indent:      currentIndent,
 	}
 
