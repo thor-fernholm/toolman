@@ -21,9 +21,11 @@ func GetMockTool(enablePTC bool) []tools.Tool {
 	}
 
 	type OmniArgs struct {
-		Enum    Enum   `json:"enum_val,omitempty"`
-		Format  string `json:"format" json-format:"DD-MM-YYY"`
-		Test123 string `json:"test,omitempty" json-format:"email" json-description:"bla bla bla"`
+		Enum    Enum    `json:"enum_val,omitempty"`
+		Format  string  `json:"format" json-format:"DD-MM-YYY"`
+		Nr      float64 `json:"float-nr" json-minimum:"0" json-maximum:"asdf" json-format:"email" json-description:"bla bla bla"`
+		Nr2     int     `json:"int-nr2" json-minimum:"-4321" json-maximum:"1.1"`
+		Test123 string  `json:"test,omitempty" json-maximum:"123.456" json-format:"email" json-description:"bla bla bla"`
 	}
 
 	omniTool := tools.NewTool("echo_omni_types",
