@@ -34,6 +34,7 @@ type BenchmarkRequest struct {
 	SystemPrompt     string          `json:"system_prompt"`
 	EnablePTC        bool            `json:"enable_ptc"`
 	TestID           string          `json:"test_entry_id"`
+	NewConv          bool
 }
 
 type Message struct {
@@ -94,7 +95,7 @@ func (c *Cache) HandleGenerateBFCL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ensure cache instance, replay cache and tracer
-	i := c.ensureCache(req)
+	i := c.ensureCache(&req)
 
 	// stop finish timer once working and defer reset
 	i.mu.Lock()
@@ -233,6 +234,14 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 		// trace error as assistant
 		i.Tracer.TraceError(i.Tracer.ChatSpan, err, false)
 		i.Tracer.Trace(prompt.AsAssistant(err.Error()), toolmanConversation, metrics)
+
+		// retry every time on rate limit!
+		if strings.Contains(err.Error(), "unexpected status code 429") {
+			backoff := max(time.Duration(1<<i.retries), time.Duration(5)) * time.Second
+			log.Printf("Prompt Error: %+v. Retrying in %v...\n", err, backoff)
+			time.Sleep(backoff)
+			continue
+		}
 
 		// update retries counter
 		i.retries++
@@ -422,7 +431,7 @@ func toolmanToBFCLCall(tool tools.Call) (ExtractedCall, error) {
 }
 
 // ensureCache clears cache on new test (only user messages inbound)
-func (c *Cache) ensureCache(req BenchmarkRequest) *Instance {
+func (c *Cache) ensureCache(req *BenchmarkRequest) *Instance {
 	c.mu.Lock()
 
 	ptcFlag := "regular-fc" // regular function calling
@@ -430,6 +439,7 @@ func (c *Cache) ensureCache(req BenchmarkRequest) *Instance {
 		ptcFlag = "ptc-fc"
 	}
 
+	newInstance := false
 	i, ok := c.Instances[req.TestID]
 	if !ok {
 		i = &Instance{
@@ -440,6 +450,7 @@ func (c *Cache) ensureCache(req BenchmarkRequest) *Instance {
 			c.finish(req.TestID)
 		})
 		c.Instances[req.TestID] = i
+		newInstance = true
 	} else {
 		i.timer.Reset(1 * time.Minute)
 	}
@@ -459,6 +470,12 @@ func (c *Cache) ensureCache(req BenchmarkRequest) *Instance {
 	if len(req.NewToolResponses) > 0 {
 		reset = false
 	}
+
+	if !reset && newInstance {
+		log.Printf("forceful reset!")
+		reset = true
+	}
+
 	if reset {
 		i.Replay.Clear()
 		i.Tracer.NewTrace(tracer.TracerRequest{
@@ -469,6 +486,8 @@ func (c *Cache) ensureCache(req BenchmarkRequest) *Instance {
 			TestID:         req.TestID,
 			PTCEnabled:     req.EnablePTC,
 		})
+		// fix for 8 failing test with long init conv.
+		req.NewConv = true
 	}
 
 	return i
@@ -532,6 +551,13 @@ func (i *Instance) addNewUserConversation(req BenchmarkRequest) []prompt.Prompt 
 				userPrompt := prompt.AsUser(m.Content)
 				i.Tracer.Trace(userPrompt, toolmanHistory, nil)
 				toolmanHistory = append(toolmanHistory, userPrompt)
+			}
+		case "assistant":
+			if req.NewConv {
+				log.Printf("adding init assistant message!")
+				assistantPrompt := prompt.AsAssistant(m.Content)
+				i.Tracer.Trace(assistantPrompt, toolmanHistory, nil)
+				toolmanHistory = append(toolmanHistory, assistantPrompt)
 			}
 		}
 	}

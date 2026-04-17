@@ -257,7 +257,7 @@ func (t *Tracer) NewTrace(req TracerRequest) {
 	)
 }
 
-var categoryRegex = regexp.MustCompile(`(?:_\d+)+$`)
+var categoryRegex = regexp.MustCompile(`(?:[_-]\d+)+$`)
 
 func ExtractCategoryRegex(testID string) string {
 	return categoryRegex.ReplaceAllString(testID, "")
