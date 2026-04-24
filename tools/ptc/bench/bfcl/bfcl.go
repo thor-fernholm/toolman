@@ -183,7 +183,7 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 
 	llm := client.Generator().Model(model).
 		System(req.SystemPrompt).
-		SetTools(bellmanTools...)
+		SetTools(bellmanTools...) //.MaxTokens(20 * 1000)
 
 	// default or set temp/think
 	if req.Temperature != nil {
@@ -236,8 +236,12 @@ func (i *Instance) replayGenerateBFCL(w http.ResponseWriter, req BenchmarkReques
 		i.Tracer.Trace(prompt.AsAssistant(err.Error()), toolmanConversation, metrics)
 
 		// retry every time on rate limit!
-		if strings.Contains(err.Error(), "unexpected status code 429") {
-			backoff := max(time.Duration(1<<i.retries), time.Duration(5)) * time.Second
+		if strings.Contains(err.Error(), "unexpected status code 429") ||
+			strings.Contains(err.Error(), "unexpected status code 502") ||
+			strings.Contains(err.Error(), "unexpected status code 500") ||
+			//strings.Contains(err.Error(), "unexpected status code 504") ||
+			strings.Contains(err.Error(), "unexpected status code, 429") {
+			backoff := max(time.Duration(1<<i.retries), time.Duration(10)) * time.Second
 			log.Printf("Prompt Error: %+v. Retrying in %v...\n", err, backoff)
 			time.Sleep(backoff)
 			continue
@@ -461,6 +465,7 @@ func (c *Cache) ensureCache(req *BenchmarkRequest) *Instance {
 
 	// reset cache if only user message, and no hist/new response
 	reset := true
+	req.NewConv = false
 	for _, m := range req.Messages {
 		if m.Role != "user" {
 			reset = false
@@ -554,13 +559,14 @@ func (i *Instance) addNewUserConversation(req BenchmarkRequest) []prompt.Prompt 
 			}
 		case "assistant":
 			if req.NewConv {
-				log.Printf("adding init assistant message!")
+				log.Printf("adding init assistant message! test id: %s", req.TestID)
 				assistantPrompt := prompt.AsAssistant(m.Content)
 				i.Tracer.Trace(assistantPrompt, toolmanHistory, nil)
 				toolmanHistory = append(toolmanHistory, assistantPrompt)
 			}
 		}
 	}
+	req.NewConv = false
 	return toolmanHistory
 }
 
